@@ -17,7 +17,7 @@ The official OpenShift and `oc-mirror` documentation already defines supported c
 
 **How to use this guide:**
 
-- read **Section 1** once to lock the mental model (`CatalogSource`, `Subscription`, `InstallPlan`, `OperatorGroup`, `CSV`, bundle)
+- read **Section 1** once to lock the mental model (`CatalogSource`, `Subscription`, `InstallPlan`, `OperatorGroup`, `CSV`, bundle image)
 - use **Section 2** as the execution playbook for `oc-mirror` v2 and disconnected operations
 - treat examples as templates and always validate channel/version decisions against your product support matrix
 
@@ -35,90 +35,95 @@ Terms are defined so that each concept is introduced before it is used. Read the
 
 An **operator** is application-specific automation for Kubernetes (and OpenShift). In practice it is one or more controllers plus API extensions that provide additional functionality to the cluster.
 
-- **Cluster Operators** — Managed by the **Cluster Version Operator (CVO)**. They are installed by default and perform core cluster functions (networking, ingress, monitoring, etc.). You do not install them via OLM.
-- **Optional add-on Operators** — Managed by the **Operator Lifecycle Manager (OLM)**. They are made available through catalogs and can be installed by users or administrators to run applications on the cluster. These are also called **OLM-based operators**.
+- **Cluster Operators** — Shipped as part of the OpenShift release payload and managed by the **Cluster Version Operator (CVO)**. During cluster installation and cluster upgrades, CVO deploys/reconciles them to the target platform version. You do not install these through OLM.
+- **Optional add-on operators** — Managed by **Operator Lifecycle Manager (OLM)**. These are installed from catalogs and are the main subject of this guide.
 
-This guide is about OLM-based operators: how they are packaged, how they appear in catalogs, and how OLM installs them when you subscribe.
+This guide primarily targets OLM-based operators, but it also covers the disconnected mirroring workflow around them (`oc-mirror`, catalog publishing, and subscription changes).
 
-#### 1.1.2 Operator Lifecycle Manager (OLM)
+#### 1.1.2 Package
 
-The **Operator Lifecycle Manager (OLM)** is the component in OpenShift that installs, upgrades, and manages the lifecycle of OLM-based operators. It does not manage Cluster Operators (those are managed by the CVO).
+A **package** is one operator product inside a catalog. It has a name (for example `advanced-cluster-management`) and contains one or more channels and many bundle versions.
 
-OLM has two main controllers that work together:
+#### 1.1.3 Bundle (bundle image)
 
-- **Catalog Operator** — Resolves *which* operator version to install by querying catalog metadata; manages `CatalogSource`, `Subscription`, and `InstallPlan`; and creates required resources from approved `InstallPlan`s (notably `CRD`s and `CSV`s).
-- **OLM Operator** — Watches `CSV`s and runs the install strategy after prerequisites are met, creating runtime resources such as `Deployment`s and RBAC and monitoring operator health.
+In this guide, **bundle** means **bundle image** unless explicitly stated otherwise.
 
-You will see these as two pods in OpenShift: `catalog-operator` and `olm-operator` in the `openshift-operator-lifecycle-manager` namespace.
-
-#### 1.1.3 Bundle
-
-A **bundle** is one installable version of an operator. That version is shipped as a **bundle image**: a non-runnable OCI image that holds the operator's manifests and metadata. One bundle = one operator version = one bundle image. OLM pulls the image and reads its contents to install the operator; it does not run the image as a workload.
+A bundle image is one installable operator version, shipped as a non-runnable OCI image that carries manifests and metadata. OLM pulls it to read manifests; it does not run the bundle image as a workload.
 
 **Layout.** A bundle image has two main parts:
 
-- **`manifests/`** — YAML that OLM uses to install this version. It contains:
-  - **One ClusterServiceVersion (`CSV`)** — A single YAML file that identifies this operator version (name, version, description, etc.) and defines how to install it. The install definition lives inside the `CSV`: the `Deployment` spec and RBAC (`ServiceAccount`, `Role`, `RoleBinding`) are embedded in the `CSV` under `spec.install` (e.g. `strategy.deployments`, `permissions`, `clusterPermissions`). The `CSV` also declares which `CRD`s this operator owns or requires.
-  - **One or more `CRD` manifests** — Separate YAML files for the custom resource definitions. OLM installs these `CRD`s first, then creates the resources specified in the `CSV` (RBAC and `Deployment`).
-- **`metadata/`** — Annotations used when this bundle is published or served elsewhere. For installation, OLM only needs `manifests/`.
+- **`manifests/`** — YAML used for installation. Typically includes:
+  - **One ClusterServiceVersion (`CSV`)** describing that operator version and install strategy.
+  - **One or more `CRD` manifests** required by that version.
+- **`metadata/`** — Bundle annotations used by catalog tooling.
 
-So: the **bundle image** is the artifact in the registry; the **`CSV`** is the main install manifest inside it. Once OLM has unpacked the bundle and applied the `CSV`, it uses the `CSV`'s embedded `Deployment` and RBAC to create the operator's workload on the cluster.
+After resolution, OLM unpacks the bundle image, applies required resources, and then uses the `CSV` install strategy to create runtime components.
 
-#### 1.1.4 Catalog
+#### 1.1.4 Channel
 
-A **catalog** is the metadata that tells OLM which operator packages exist, which versions (bundles) are available, and how upgrades connect (channels, replace edges, skip ranges). It does *not* contain the operator container images themselves; it points to bundle images.
+A **channel** is an upgrade lane within a package. It is a named sequence of bundle entries and upgrade edges (for example `stable`, `release-2.13`, `latest`). A package can expose multiple channels, and a bundle version can appear in more than one channel.
 
-**Catalog image (index image).** In OpenShift this metadata is stored as a file-based catalog inside an OCI container image. That image is the **catalog image** (also called **index image**). Documentation that refers to "the catalog," "catalog image," or "index image" usually means the same thing: an image whose contents are catalog metadata (package definitions, channels, bundle references, upgrade edges).
+#### 1.1.5 Catalog
 
-**Catalog families.** In current OCP releases, Red Hat provides three default catalog sources:
+A **catalog** is metadata that tells OLM what packages/channels/bundles exist and how upgrades connect (`replaces`, `skipRange`). It does *not* contain the operator runtime container images; it points to bundle images.
 
-- **Red Hat Operators** — Red Hat–published content.
-- **Certified Operators** — Partner content certified by Red Hat.
-- **Community Operators** — Community-maintained content (different support model).
+In OpenShift, this metadata is stored in an OCI **catalog image** (also called **index image**), commonly from families such as:
 
-In some older OCP releases and environments, you may also see **Red Hat Marketplace** (`redhat-marketplace`) as an additional catalog source.
+- **Red Hat Operators**
+- **Certified Operators**
+- **Community Operators**
 
-**Version per OCP version.** Each catalog image is tagged by OpenShift Container Platform (OCP) minor version. For example, `redhat-operator-index:v4.16`, `redhat-operator-index:v4.18`, and `certified-operator-index:v4.18` are distinct images. The package set, default channels, and supported upgrade paths can differ between OCP versions, so you must use the catalog image that matches the OCP minor you are targeting (e.g. `v4.18` for an OCP 4.18 cluster). They are not interchangeable across versions.
+Some older releases and environments may also include **Red Hat Marketplace** (`redhat-marketplace`).
 
-**`CatalogSource`.** The cluster needs a Kubernetes resource that tells OLM *where* to find a catalog. A **`CatalogSource`** (in OpenShift, typically in `openshift-marketplace`) points at a catalog image. OLM uses it to discover packages, channels, and bundles and to resolve `Subscription`s to a concrete bundle/`CSV`. The cluster runs a pod that serves the catalog (e.g. using `opm` or the registry server) and exposes a gRPC API; the Catalog Operator queries this API. Without a `CatalogSource` pointing at your catalog image, OLM cannot see your operators. In disconnected environments, the catalog image is usually hosted in your internal registry and the `CatalogSource` points to that image.
+Catalog images are versioned by OCP minor (for example `redhat-operator-index:v4.18`) and are not interchangeable across OCP minors.
 
-#### 1.1.5 Package
+#### 1.1.6 `CatalogSource` / `ClusterCatalog`
 
-A **package** is one operator product inside a catalog. It has a name (e.g. `advanced-cluster-management`, `openshift-pipelines-operator-rh`) and contains one or more channels and many bundles (one per version).
+The cluster needs an object that points OLM to a catalog image:
 
-#### 1.1.6 Channel
+- **`CatalogSource`** — Common pattern in `openshift-marketplace`.
+- **`ClusterCatalog`** — Newer form that may be generated/used on newer clusters/builds.
 
-A **channel** is an upgrade track within a package. It is a named sequence of bundle versions and upgrade edges (e.g. "from 2.13.4 you can upgrade to 2.13.5"). Channel names are chosen by the publisher (e.g. `stable`, `release-2.13`, `latest`). A package can have multiple channels, and the same bundle version can appear in more than one channel.
+Without one of these pointing to your mirrored catalog image, OLM cannot resolve packages/channels for disconnected installs.
 
-#### 1.1.7 Subscription
+#### 1.1.7 `Subscription`
 
-A **`Subscription`** is a Kubernetes resource that expresses: “I want this operator package, from this catalog, on this channel, and here is how I want updates approved.”
+A **`Subscription`** expresses: "Install this package from this catalog object on this channel."
 
-It specifies:
+Key fields include:
 
-- **Package name** — e.g. `advanced-cluster-management`.
-- **`CatalogSource`** (and namespace) — Which catalog to use (e.g. `redhat-operators`, `sourceNamespace: openshift-marketplace`).
-- **Channel** — e.g. `release-2.13` or `stable`.
-- **Approval** — `Automatic` or `Manual` for installing/upgrading (controls whether `InstallPlan`s are auto-approved).
-- **Optional `startingCSV`** — Initial CSV to start from when creating a new subscription path.
+- **Package name** (`name`)
+- **Catalog reference** (`source` / `sourceNamespace`)
+- **Channel** (`channel`)
+- **Approval policy** (`installPlanApproval`: `Automatic` or `Manual`)
+- **Optional start point** (`startingCSV`)
 
-The **Catalog Operator** watches `Subscription`s. When it sees a `Subscription`, it consults the catalog (via the `CatalogSource`'s gRPC API), resolves the appropriate bundle(s) for the requested channel, and creates an `InstallPlan`.
+The Catalog Operator watches `Subscription`s and resolves them to an `InstallPlan`.
 
-#### 1.1.8 InstallPlan
+#### 1.1.8 `InstallPlan`
 
-An **`InstallPlan`** is a Kubernetes resource generated by the **Catalog Operator**. It is the *plan* for what to install: a list of resources (`CRD`s, `CSV`, etc.) that correspond to the resolved bundle(s).
+An **`InstallPlan`** is a Catalog Operator resource listing what should be installed for a resolved subscription.
 
-- **Approval** — If the `Subscription` has `installPlanApproval: Manual`, the `InstallPlan` must be approved (e.g. `spec.approved: true`) before the **Catalog Operator** executes it. If approval is `Automatic`, the Catalog Operator approves it and installation proceeds.
-- **Execution** — The **Catalog Operator** creates the resources listed in the approved `InstallPlan` (for example `CRD`s and `CSV`s). The **OLM Operator** then reconciles the resulting `CSV` and runs its install strategy to create runtime resources.
-- **History** — `InstallPlan`s are kept as a record of what was installed; they are not deleted when upgrades occur.
+- **Approval** — Manual subscriptions require explicit approval (`spec.approved: true`).
+- **Execution** — The Catalog Operator executes approved plans and creates resources such as `CRD`s and `CSV`s.
+- **History** — InstallPlans remain as an audit/history trail.
 
-#### 1.1.9 OperatorGroup
+#### 1.1.9 `OperatorGroup`
 
-An **`OperatorGroup`** defines the target namespaces for operators installed in a namespace and is a required part of OLM tenancy/scoping.
+An **`OperatorGroup`** defines operator scope (target namespaces) for a namespace.
 
-- **Membership gate** — A `CSV` must be an active member of an `OperatorGroup` before OLM runs its install strategy.
-- **Target namespace scope** — The `OperatorGroup` determines where RBAC is projected and which namespaces the operator is configured to watch.
-- **Practical rule** — In customer environments, keep one clearly-owned `OperatorGroup` in each namespace where you install operators, and avoid overlapping/conflicting groups.
+- A `CSV` must be an active member of an `OperatorGroup` before install strategy runs.
+- It controls where RBAC is projected and how operator watch scope is derived.
+- In practice, keep ownership clear and avoid overlapping/conflicting groups in the same namespace.
+
+#### 1.1.10 Operator Lifecycle Manager (OLM)
+
+With the objects above in place, OLM controllers do the orchestration:
+
+- **Catalog Operator** — Watches `CatalogSource`/`ClusterCatalog`, `Subscription`, and `InstallPlan`; resolves bundles and executes approved install plans.
+- **OLM Operator** — Watches `CSV`s and runs the CSV install strategy to create/update runtime resources (`Deployment`, RBAC, etc.).
+
+You will typically see `catalog-operator` and `olm-operator` pods in the `openshift-operator-lifecycle-manager` namespace.
 
 ---
 
@@ -208,15 +213,16 @@ flowchart TB
 | Concept | One-line mental model |
 |--------|------------------------|
 | **Operator** | Application automation (controllers + APIs). OLM-based = optional add-on managed by OLM. |
-| **OLM** | Installs and manages OLM-based operators. Catalog Operator = resolve + execute approved `InstallPlan`. OLM Operator = reconcile `CSV` and run install strategy. |
-| **Bundle / bundle image** | One operator version = one non-runnable image with manifests/ (`CSV` + `CRD`s) and metadata/. |
-| **`CSV`** | Single installable-version manifest inside the bundle: identity, install strategy (`Deployment` + RBAC embedded), and `CRD` references. |
-| **Catalog / catalog image / `CatalogSource`** | Catalog = metadata (packages, channels, bundles). Catalog image = OCI image holding that metadata; one per OCP minor. `CatalogSource` = cluster resource pointing at a catalog image. |
 | **Package** | One operator product in a catalog (e.g. advanced-cluster-management). |
+| **Bundle image** | One installable operator version packaged as a non-runnable OCI image containing manifests and metadata. |
 | **Channel** | Upgrade track inside a package (e.g. stable, release-2.13). |
-| **`Subscription`** | "I want this package from this catalog and channel." Drives resolution and `InstallPlan`. |
-| **`OperatorGroup`** | Defines tenancy/scope for operators in a namespace; `CSV` must be an active member before install strategy runs. |
-| **`InstallPlan`** | Catalog Operator's plan (list of resources to install). Catalog Operator executes it when approved. |
+| **Catalog image** | OCI image holding package/channel/bundle metadata and upgrade edges for a specific OCP minor. |
+| **`CatalogSource` / `ClusterCatalog`** | Cluster object that tells OLM where to read a catalog image from. |
+| **`Subscription`** | "Install this package from this catalog object on this channel." |
+| **`InstallPlan`** | Catalog Operator's actionable plan generated from a resolved subscription. |
+| **`OperatorGroup`** | Namespace scope/tenancy guardrail for operator installation and watch targets. |
+| **`CSV`** | Installable operator-version record that defines install strategy and required APIs. |
+| **OLM** | Catalog Operator resolves + executes approved plans; OLM Operator reconciles CSV install strategy into runtime resources. |
 
 ---
 
@@ -464,7 +470,69 @@ oc get pods -n openshift-marketplace
 - **Mirror redirect (IDMS/ITMS) rollout** triggers a MachineConfig change and rolling node restart (30+ minutes on large clusters). Apply catalog only after rollout completes.
 - **v1 is deprecated.** Use `opm render` (and path solver) for real workflows; reserve `oc mirror list operators --v1` for quick exploration only.
 
-### 2.15 References
+## 3. Mirror only required versions (`skipRange`) and use the path solver
+
+If you hear "`skipVersion`", read it as `skipRange` in FBC metadata. The practical objective is to mirror only what is required for a valid upgrade path.
+
+**Recommended workflow:**
+
+1. Render the catalog metadata stream:
+
+```bash
+opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 > catalog.json
+```
+
+2. Compute the shortest valid hop path:
+
+```bash
+./resolve-operator-path.sh \
+  advanced-cluster-management \
+  2.11.4 \
+  2.13.5 \
+  catalog.json \
+  registry.redhat.io/redhat/redhat-operator-index:v4.18
+```
+
+3. Use the generated ImageSetConfiguration snippet as your base and keep `minVersion` only if you want floating heads in that channel.
+4. Add `maxVersion` only if you need exact pinning for change-control.
+5. Keep channel choice aligned with the support matrix for your OCP version.
+6. Mirror and publish as usual (`m2d`/`d2m` or `m2m`), then verify the target bundle is actually present in your mirrored catalog.
+
+## 4. Install/upgrade an existing operator with a mirrored catalog
+
+This section is the practical "cluster-side" procedure after mirror publish.
+
+1. Apply mirror redirects first (`idms.yaml`, `itms.yaml`) and wait for MCP rollout completion.
+2. Publish catalog metadata for operators.
+3. If `clusterCatalog.yaml` is generated, use it as authoritative for that environment.
+4. If using `CatalogSource`, prefer creating a dedicated mirrored source instead of replacing the default `redhat-operators`.
+5. Retag the mirrored index to an immutable operational tag (for example with date/version) and point your mirrored `CatalogSource` to that exact tag.
+6. Update the operator `Subscription` to use the mirrored source and supported channel.
+
+```bash
+oc -n <operator-namespace> patch subscription <subscription-name> \
+  --type merge \
+  --patch '{"spec":{
+    "source":"redhat-operators-mirrored",
+    "sourceNamespace":"openshift-marketplace",
+    "channel":"<supported-channel>",
+    "installPlanApproval":"Manual"
+  }}'
+```
+
+7. If you must force an initial target, set `startingCSV` explicitly in the subscription spec.
+8. Approve the pending `InstallPlan` (if manual), then verify resulting `CSV` phase and operator deployment health.
+
+```bash
+oc get installplan -n <operator-namespace>
+oc patch installplan <plan-name> -n <operator-namespace> \
+  --type merge --patch '{"spec":{"approved":true}}'
+oc get csv -n <operator-namespace>
+```
+
+9. Keep old mirrored catalog tags until validation is complete; then prune intentionally.
+
+## 5. References
 
 - [oc-mirror README (v2)](https://github.com/openshift/oc-mirror/blob/main/README.md)
 - [oc-mirror on GitHub](https://github.com/openshift/oc-mirror)
