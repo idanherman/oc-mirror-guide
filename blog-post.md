@@ -254,7 +254,7 @@ See Section 6 for details and diagrams.
 
 ### Download the Binary
 
-Get oc-mirror from the [Red Hat Hybrid Cloud Console](https://console.redhat.com/openshift/downloads) → OpenShift disconnected installation tools → OpenShift Client (oc) mirror plugin → Select OS Type and architecture → Download
+Get oc-mirror from the [Red Hat Hybrid Cloud Console](https://console.redhat.com/openshift/downloads) -> OpenShift disconnected installation tools -> OpenShift Client (oc) mirror plugin -> Select OS Type and architecture -> Download.
 
 The binary is not tied 1:1 to a single OCP minor release the way the catalog index image tag is. The tighter coupling to a specific OCP release is in your **ImageSetConfiguration** (the index image tag you reference, e.g. `redhat-operator-index:v4.18`) — more on that in Section 3. Still, use the build your OpenShift toolchain policy expects, and verify behavior on that build with `oc-mirror --v2 --help`.
 
@@ -269,7 +269,7 @@ oc-mirror v1 is deprecated as of OCP 4.18 and will eventually be removed. Use `-
 
 ### Authentication
 
-What it **does** need is a valid auth file so it can authenticate against `registry.redhat.io`.
+The binary does not require Podman or Docker, but it does require a valid auth file so it can authenticate against `registry.redhat.io`.
 
 The upstream v2 README documents these default locations:
 
@@ -280,7 +280,9 @@ $XDG_RUNTIME_DIR/containers/auth.json
 
 If your host stores credentials somewhere else (for example `~/.config/containers/auth.json`, which is common on Podman-based systems), pass `--authfile` explicitly so there is no ambiguity.
 
-The easiest way to populate one is `podman login registry.redhat.io` if Podman is available (Podman is not a requirement; oc-mirror does not exec Podman or Docker. It is a self-contained Go binary that handles image operations internally using the `containers/image` library.). If Podman is not available, download your [pull secret](https://console.redhat.com/openshift/install/pull-secret) from the Hybrid Cloud Console. The download is already valid JSON with an `auths` key; you can save it as `auth.json` as-is. If you want to validate or merge it with an existing auth file, `jq` is useful (for example `jq . pull-secret` to validate), but it is not required — the raw file is fine.
+The easiest way to populate one is `podman login registry.redhat.io` if Podman is available. Podman is not a requirement: oc-mirror does not exec Podman or Docker. It is a self-contained Go binary that handles image operations internally using the `containers/image` library.
+
+If Podman is not available, download your [pull secret](https://console.redhat.com/openshift/install/pull-secret) from the Hybrid Cloud Console. The download is already valid JSON with an `auths` key, so you can save it as `auth.json` as-is. If you want to validate or merge it with an existing auth file, `jq` is useful (for example `jq . pull-secret` to validate), but it is not required.
 
 Another option is to use `--authfile` with the pull-secret:
 
@@ -321,12 +323,12 @@ mirror:
 
 ### Read the `operators` Stanza From Left to Right
 
-For a new reader, this part of the YAML is easier if you read it as a chain of narrowing choices:
+For a new reader, this part of the YAML is easier to read as a chain of narrowing choices:
 
-- `**catalog**`: Which metadata source are you reading from?
-- `**packages[].name**`: Which operator inside that catalog do you want?
-- `**channels[].name**`: Which upgrade track for that operator do you want?
-- `**minVersion` / `maxVersion**`: Which versions inside that channel do you want?
+- `catalog`: Which metadata source are you reading from?
+- `packages[].name`: Which operator inside that catalog do you want?
+- `channels[].name`: Which upgrade track for that operator do you want?
+- `minVersion` / `maxVersion`: Which versions inside that channel do you want?
 
 If you skip one of those choices, oc-mirror still makes a choice for you. That can be convenient, but it is also where many accidental oversized mirrors begin.
 
@@ -378,7 +380,7 @@ Example:
 - and your current OCP version supports ACM `2.14`
 - and you want to stay on the `2.14.x` line
 
-then the safer default is `**release-2.14`**.
+then the safer default is `release-2.14`.
 
 Why? Because `latest` may later move to `2.15.x` (or another newer minor) while your current OCP version may not support that newer operator minor yet.
 
@@ -396,9 +398,9 @@ oc-mirror treats `additionalImages` as plain image copies. There are no channels
 
 ### The Key Levers
 
-`**minVersion` / `maxVersion`:** Mirror only bundles in a version range. If you omit `maxVersion`, oc-mirror will pick up new z-stream releases automatically on future runs — useful for keeping the config unchanged while staying current.
+`minVersion` / `maxVersion`: Mirror only bundles in a version range. If you omit `maxVersion`, oc-mirror will pick up new z-stream releases automatically on future runs, which is useful when you want to keep the config unchanged while staying current.
 
-**No `maxVersion` = floating cap:**
+**No `maxVersion`: floating head.**
 
 ```yaml
 channels:
@@ -471,7 +473,7 @@ jq -r \
 
 If you have the `resolve-operator-path.sh` script included in this guide package, it automates this analysis. Feed it the raw `opm render` output and it walks the `olm.channel.entries[]` graph to find the shortest valid hop sequence from your installed version to the target:
 
-It uses Bash associative arrays, so run it with Bash 4+ (on older macOS shells, install a newer Bash first).
+It uses Bash associative arrays, so run it with Bash 4+. On many macOS systems, `/bin/bash` is still the old 3.2 build, so install a newer Bash and invoke that binary explicitly instead of relying on the default shell.
 
 ```bash
 opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 > catalog.json
@@ -483,7 +485,7 @@ opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 > catalog.json
   registry.redhat.io/redhat/redhat-operator-index:v4.18
 ```
 
-The script prints the shortest valid hop path and then emits an ImageSetConfiguration snippet. It intentionally uses `minVersion` only for each required channel segment (a floating head), so future z-streams in those channels remain in scope. If you want an exact pin, add `maxVersion` yourself after reviewing the output.
+The script prints the shortest valid hop path and then emits an ImageSetConfiguration snippet. It intentionally uses `minVersion` only for each required channel segment (a floating head), so future z-streams in those channels remain in scope. If the target version exists in multiple channels, treat the emitted final channel as a reachability hint, not an automatic support-policy decision. If you want an exact pin, add `maxVersion` yourself after reviewing the output.
 
 ### The v1 Shortcut for Exploring Channels
 
@@ -887,7 +889,7 @@ OLM resolves the upgrade path. If the 2.13.5 bundle's `skipRange` covers 2.11.4,
 
 ## 12. Caveats
 
-`**skipDependencies` is not something to trust blindly.** The field exists in the ImageSetConfiguration API, but it is not a safe substitute for testing your exact release combination. If dependency trimming matters, validate the result in pre-production instead of assuming that flag will exclude everything you expect.
+**`skipDependencies` is not something to trust blindly.** The field exists in the ImageSetConfiguration API, but it is not a safe substitute for testing your exact release combination. If dependency trimming matters, validate the result in pre-production instead of assuming that flag will exclude everything you expect.
 
 **The catalog default channel may not be the supported one for your OCP version.** Every operator has a "default channel" in the catalog; for many operators it targets a newer OCP version than yours. Always pin the Subscription's channel to what the product support matrix specifies (see also Section 3, "The gotcha with default channels").
 
