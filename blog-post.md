@@ -107,6 +107,8 @@ flowchart TB
     SUB["Subscription: channel release-2.14"] --> C214
 ```
 
+
+
 This is the object model:
 
 - One **catalog image** contains metadata for many packages.
@@ -130,7 +132,7 @@ flowchart LR
         A["release-2.12: ...v2.12.0"]
         B["release-2.12: ...v2.12.1"]
         C["release-2.12: ...v2.12.2"]
-        D["release-2.13: ...v2.13.5<br/>skipRange: &gt;=2.11.0 &lt;2.13.5"]
+        D["release-2.13: ...v2.13.5<br/>skipRange: >=2.11.0 <2.13.5"]
         E["latest: ...v2.14.0"]
         F["release-2.14: ...v2.14.3 (target)"]
         POST["Other later entries not needed"]
@@ -143,13 +145,14 @@ flowchart LR
     SEL --> F
 ```
 
+
+
 This is the upgrade-planning view:
 
 - The catalog may contain many entries across multiple channels.
 - The shortest valid path may require only a subset of those entries.
 - That subset can cross channel boundaries.
 - So the job is not "mirror every bundle in one channel." Mirror the specific entries required to make the target reachable, then choose the supported channel you want OLM to resolve against.
-
 - **Package:** The operator's product name in the catalog, for example `advanced-cluster-management` or `openshift-pipelines-operator-rh`.
 - **Channel:** A publisher-defined upgrade track inside that package, such as `release-2.13`, `pipelines-1.20`, `stable-1.37`, `stable`, or `latest`.
 - **Bundle image:** The OCI image for one operator version. It carries manifests and metadata for that version.
@@ -184,7 +187,7 @@ These names are not a universal contract. They usually indicate an upgrade track
 
 Two common misconceptions:
 
-- **`latest` is not a superset of every other channel.** If a package exposes a channel literally named `latest`, that `latest` channel is still just one track. It has its own head and its own upgrade edges.
+- `**latest` is not a superset of every other channel.** If a package exposes a channel literally named `latest`, that `latest` channel is still just one track. It has its own head and its own upgrade edges.
 - **A channel does not automatically contain all historical versions from all other channels.** The upgrade graph is defined per channel. Some bundle versions may appear in multiple channels, but channels are still separate tracks.
 
 For disconnected planning, the safest mental model is: **treat the channel as a support boundary, not just as a path that happens to contain the target version**. If the same target version appears in `latest`, `stable`, and `release-2.14`, the best default is usually the most specific supported versioned channel (`release-2.14`), because that is less likely to surface a newer unsupported minor for your current OCP version later.
@@ -258,10 +261,10 @@ Get oc-mirror from the [Red Hat Hybrid Cloud Console](https://console.redhat.com
 
 The binary is not tied 1:1 to a single OCP minor release the way the catalog index image tag is. The tighter coupling to a specific OCP release is in your **ImageSetConfiguration** (the index image tag you reference, e.g. `redhat-operator-index:v4.18`) — more on that in Section 3. Still, use the build your OpenShift toolchain policy expects, and verify behavior on that build with `oc-mirror --v2 --help`.
 
-You will see both **`oc-mirror`** and **`oc mirror`** in docs and examples. They are the **same binary**; the difference is how you invoke it and where the binary must live.
+You will see both `**oc-mirror`** and `**oc mirror**` in docs and examples. They are the **same binary**; the difference is how you invoke it and where the binary must live.
 
 - **Standalone:** The downloaded executable is named `oc-mirror`. You can run it by path without putting it on `PATH` — for example `./oc-mirror` from the directory where it lives. No `oc` CLI is required. Handy on a jump host that only needs mirroring.
-- **Plugin:** The OpenShift CLI (`oc`) looks for executables named `oc-<subcommand>` on your `PATH`. If the binary is on `PATH` as `oc-mirror`, then `oc mirror` runs that binary — **`oc` literally invokes the `oc-mirror` executable** behind the scenes. The added value is convenience: one command (`oc`) for both cluster operations and mirroring, and consistency with other `oc` subcommands (e.g. `oc adm`, `oc mirror`).
+- **Plugin:** The OpenShift CLI (`oc`) looks for executables named `oc-<subcommand>` on your `PATH`. If the binary is on `PATH` as `oc-mirror`, then `oc mirror` runs that binary — `**oc` literally invokes the `oc-mirror` executable** behind the scenes. The added value is convenience: one command (`oc`) for both cluster operations and mirroring, and consistency with other `oc` subcommands (e.g. `oc adm`, `oc mirror`).
 
 ### Use v2 for Mirroring Workflows
 
@@ -863,7 +866,7 @@ OLM resolves the upgrade path. If the 2.13.5 bundle's `skipRange` covers 2.11.4,
 | `oc-mirror` keeps failing mid-run on a slow link                 | Retry and timeout settings are too low for the connection                                      | Your command line, proxy path, and whether failures happen on large images                                                    | Raise `--retry-times` and use a longer `--image-timeout` such as `1h`                                               |
 | `d2m` cannot find content to publish                             | Wrong `--from` path or the tarballs were not copied intact                                     | The directory contains `mirror_seq*.tar` and matches the path passed to `--from`                                              | Re-copy the tarballs and point `--from` at the directory that contains them                                         |
 | OperatorHub stays empty after a successful push                  | The generated catalog manifest was never applied, or the catalog pod cannot start              | `working-dir/cluster-resources/`, `oc get catalogsource -n openshift-marketplace`, and `oc get pods -n openshift-marketplace` | Apply the generated `catalogsource.yaml` or `clusterCatalog.yaml`, then inspect the catalog pod logs                |
-| Catalog pod shows `ImagePullBackOff` in a disconnected cluster   | IDMS or ITMS was not applied first, or the MachineConfig rollout is still in progress          | `oc get mcp`, `oc get catalogsource -n openshift-marketplace`, and the catalog pod events                                     | Apply IDMS and ITMS first, wait for MCP rollout, then re-apply the catalog (Section 8).                               |
+| Catalog pod shows `ImagePullBackOff` in a disconnected cluster   | IDMS or ITMS was not applied first, or the MachineConfig rollout is still in progress          | `oc get mcp`, `oc get catalogsource -n openshift-marketplace`, and the catalog pod events                                     | Apply IDMS and ITMS first, wait for MCP rollout, then re-apply the catalog (Section 8).                             |
 | The operator tile exists, but install fails on an unmapped image | You mirrored a full catalog image but not all of the packages it advertises                    | Whether OperatorHub shows operators you did not intentionally mirror                                                          | Publish a separate CatalogSource for the mirrored subset, or mirror the missing content intentionally               |
 | OLM does not offer the upgrade version you expected              | Wrong channel, unsupported channel for your OCP version, or the target bundle was not mirrored | The `Subscription`, the support matrix, and the catalog entry for the target bundle                                           | Correct the channel, verify support for your OCP version, and confirm the target version is in the mirrored catalog |
 
@@ -873,23 +876,23 @@ OLM resolves the upgrade path. If the 2.13.5 bundle's `skipRange` covers 2.11.4,
 ## 11. Quick Reference
 
 
-| Flag                | What it does                              | When to use                                               |
-| ------------------- | ----------------------------------------- | --------------------------------------------------------- |
-| `--v2`              | Selects v2 behavior                       | Always                                                    |
-| `--retry-times N`   | Retries failed image pulls N times        | Any production mirror run; set to at least 3              |
-| `--image-timeout D` | Per-image timeout duration (`10m`, `1h`)  | Slow links or large images; try `1h` on constrained links |
-| `--authfile`        | Auth file path override                   | Non-default credential location                           |
-| `--from`            | Source directory for d2m                  | Air-gapped side: point at directory with tarballs         |
-| `--workspace`       | Metadata workspace for m2m                | Bastion/m2m workflows                                     |
-| `--since`           | Incremental: only content newer than date | Subsequent runs on same workspace                         |
-| `--cache-dir`       | Override cache location (default under $HOME) | Shared systems or custom disk layouts                 |
+| Flag                | What it does                                  | When to use                                               |
+| ------------------- | --------------------------------------------- | --------------------------------------------------------- |
+| `--v2`              | Selects v2 behavior                           | Always                                                    |
+| `--retry-times N`   | Retries failed image pulls N times            | Any production mirror run; set to at least 3              |
+| `--image-timeout D` | Per-image timeout duration (`10m`, `1h`)      | Slow links or large images; try `1h` on constrained links |
+| `--authfile`        | Auth file path override                       | Non-default credential location                           |
+| `--from`            | Source directory for d2m                      | Air-gapped side: point at directory with tarballs         |
+| `--workspace`       | Metadata workspace for m2m                    | Bastion/m2m workflows                                     |
+| `--since`           | Incremental: only content newer than date     | Subsequent runs on same workspace                         |
+| `--cache-dir`       | Override cache location (default under $HOME) | Shared systems or custom disk layouts                     |
 
 
 ---
 
 ## 12. Caveats
 
-**`skipDependencies` is not something to trust blindly.** The field exists in the ImageSetConfiguration API, but it is not a safe substitute for testing your exact release combination. If dependency trimming matters, validate the result in pre-production instead of assuming that flag will exclude everything you expect.
+`**skipDependencies` is not something to trust blindly.** The field exists in the ImageSetConfiguration API, but it is not a safe substitute for testing your exact release combination. If dependency trimming matters, validate the result in pre-production instead of assuming that flag will exclude everything you expect.
 
 **The catalog default channel may not be the supported one for your OCP version.** Every operator has a "default channel" in the catalog; for many operators it targets a newer OCP version than yours. Always pin the Subscription's channel to what the product support matrix specifies (see also Section 3, "The gotcha with default channels").
 
@@ -909,3 +912,4 @@ OLM resolves the upgrade path. If the 2.13.5 bundle's `skipRange` covers 2.11.4,
 - [OCP Operator Upgrade Information (OUIC)](https://access.redhat.com/labs/ocpouic/)
 - [Red Hat solution 7061405 — EUS shortest path and oc-mirror](https://access.redhat.com/solutions/7061405)
 - [File-based catalogs (OLM)](https://olm.operatorframework.io/docs/reference/file-based-catalogs/)
+
