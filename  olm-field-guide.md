@@ -31,7 +31,7 @@ The terminology, installation flow, and mental model below are the core concepts
 
 ### 1.1 Terminology
 
-Terms are defined in a practical order used during real disconnected projects.
+Terms are ordered to make the flow easier to follow: each concept is introduced before it is used heavily in later sections.
 
 #### 1.1.1 Operator
 
@@ -52,12 +52,12 @@ In this guide, **bundle** means **bundle image** unless explicitly stated otherw
 
 A bundle image is one installable operator version, shipped as a non-runnable OCI image that carries manifests and metadata. OLM pulls it to read manifests; it does not run the bundle image as a workload.
 
-**Layout.** A bundle image has two main parts:
+**Directory layout.** A bundle image has two main directories:
 
-- **`manifests/`** — YAML used for installation. Typically includes:
+- **`manifests/`** — YAML manifests used for installation. Typically includes:
   - **One ClusterServiceVersion (`CSV`)** describing that operator version and install strategy.
   - **One or more `CRD` manifests** required by that version.
-- **`metadata/`** — Bundle annotations used by catalog tooling (commonly `annotations.yaml`, and depending on build pipeline, related metadata files).
+- **`metadata/`** — Catalog annotations used by tooling. In many bundles this is primarily `annotations.yaml`; some build pipelines add related metadata files.
 
 The bundle unpack job extracts bundle manifests into a `ConfigMap`. Later OLM controllers use that unpacked content during `InstallPlan` execution and `CSV` reconciliation (explained in sections 1.1.10 and 1.2).
 
@@ -71,7 +71,7 @@ Version notation is typically `x.y.z`:
 - `y` = minor stream
 - `z` = patch (z-stream)
 
-Publishers use channels to control release cadence and support lanes (for example conservative vs fast-moving lanes). A package can expose multiple channels, and a bundle version can appear in more than one channel.
+Publishers use channels to control release cadence and support lanes (for example conservative vs fast-moving lanes). A package can expose multiple channels, and a bundle version can appear in more than one channel. In disconnected environments this matters even more, because every additional channel or version often means additional content you must mirror, transfer, and validate.
 
 #### 1.1.5 Catalog
 
@@ -89,6 +89,19 @@ Some older releases and environments may also include **Red Hat Marketplace** (`
 
 Catalog images are versioned by OCP minor (for example `redhat-operator-index:v4.18`) and are not interchangeable across OCP minors. Modern index images carry **file-based catalog (FBC)** content, which you can inspect with `opm render`.
 
+At a high level, FBC data is a stream of objects such as:
+
+- `olm.package` (package definitions)
+- `olm.channel` (channel entries + upgrade edges)
+- `olm.bundle` (bundle metadata + bundle image reference)
+
+`opm` is the catalog utility used to inspect this content. Example:
+
+```bash
+opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 > catalog.json
+jq -r 'select(.schema=="olm.channel") | .package, .name' catalog.json
+```
+
 #### 1.1.6 `CatalogSource` / `ClusterCatalog`
 
 The cluster needs a Kubernetes resource that points OLM to a catalog image:
@@ -96,7 +109,7 @@ The cluster needs a Kubernetes resource that points OLM to a catalog image:
 - **`CatalogSource`** (`operators.coreos.com/v1alpha1`) — OLM Classic catalog source object, widely used across OCP 4.x environments.
 - **`ClusterCatalog`** (`olm.operatorframework.io/v1`) — OLM v1/extensions catalog object, documented in newer OCP flows (for example OCP 4.20 docs and oc-mirror v2 generated outputs).
 
-Without one of these pointing to your mirrored catalog image, OLM cannot resolve packages/channels for disconnected installs.
+Without one of these pointing to your mirrored catalog image, OLM cannot resolve packages/channels for disconnected installs. After creation in the API/etcd, the catalog backend pod(s) are reconciled and started to serve catalog data to OLM.
 
 #### 1.1.7 `Subscription`
 
@@ -110,9 +123,11 @@ Key fields include:
 - **Approval policy** (`installPlanApproval`: `Automatic` or `Manual`)
 - **Optional start point** (`startingCSV`)
 
+Bundle/CSV selection is resolved from channel metadata at runtime: by default OLM resolves to the channel head that satisfies constraints; `startingCSV` can pin the initial target when you need controlled starting behavior.
+
 The Catalog Operator watches `Subscription`s and resolves them to an `InstallPlan`.
 
-#### 1.1.8 `InstallPlan`
+#### 1.1.8 `InstallPlan` 
 
 An **`InstallPlan`** is a Catalog Operator resource listing what should be installed for a resolved subscription.
 
@@ -269,6 +284,8 @@ Three workflows cover different connectivity patterns:
 
 For a full air-gap, you typically run **m2d** on a connected machine, transfer the tarballs, then run **d2m** on a host inside the secure network. If you have a bastion that can see both sides, **m2m** avoids the intermediate disk step.
 
+`m2m` is still mirror-to-mirror. In practice, it can be used for internal-to-internal promotion if the host can reach both source and destination registries and has valid credentials for both. The same reachability, auth, and policy checks still apply.
+
 ### 2.3 Set up oc-mirror
 
 #### 2.3.1 Obtain the binary
@@ -300,6 +317,11 @@ The only v1-only feature still useful for exploration is `oc mirror list operato
 Quick exploration examples:
 
 ```bash
+# List available packages in a catalog
+oc mirror list operators \
+  --catalog=registry.redhat.io/redhat/redhat-operator-index:v4.18 \
+  --v1
+
 # List channels for a package
 oc mirror list operators \
   --catalog=registry.redhat.io/redhat/redhat-operator-index:v4.18 \
@@ -341,7 +363,7 @@ oc-mirror --authfile /etc/mirror/pull-secret -c config.yaml file:///mirror-dir -
 Before you run oc-mirror you need:
 
 1. **ImageSetConfiguration** — A YAML file (e.g. `config.yaml`) that specifies what to mirror: platform channels, operator catalogs and packages/channels/versions, and any additional images. See section 2.7 for how to define it.
-2. **Destination** — For **m2d**: a local directory path (e.g. `file:///mnt/usb/mirror-dir`). For **d2m** or **m2m**: a registry URL (e.g. `docker://registry.example.com:5000`). 
+2. **Destination** — For **m2d**: a local directory path (e.g. `file:///mnt/usb/mirror-dir`). For **d2m** or **m2m**: a registry URL (e.g. `docker://registry.example.com:5000`).
 3. **Credentials** — Auth file for the source registry (and for d2m/m2m, access to the destination registry as needed).
 
 After a successful run, oc-mirror writes tarballs (m2d) and/or pushes images (d2m, m2m) and generates cluster resources (mirror sets, `CatalogSource` or `ClusterCatalog`, etc.) that you apply on the cluster so it uses the mirrored content.
@@ -370,7 +392,7 @@ oc-mirror \
 Do not confuse these two directories:
 
 - **Workspace** — The `file://` path you pass on the command line. For **m2d** it holds tarballs and `working-dir/`. For **m2m** it holds only metadata (no tarballs). Only the tarballs cross the air-gap; `working-dir/` is recreated from the tarballs when you run d2m on the other side.
-- **Cache** — An internal directory (default under `$HOME`; override with `--cache-dir`; confirm with `oc-mirror --v2 --help`) where oc-mirror stores blobs and metadata for performance. It is separate from the workspace. Do not transfer the cache across the air-gap. Deleting it does not delete your tarballs; the next run will re-download more. Delete the cache only if it is corrupted.
+- **Cache** — An internal directory (default under `$HOME`; override with `--cache-dir`; confirm with `oc-mirror --v2 --help`) where oc-mirror stores blobs and metadata for performance. It is separate from the workspace. Do not transfer the cache across the air-gap. Deleting it does not delete your tarballs; the next run will re-download more. If local disk is full, clearing cache is a valid recovery action to free space and allow the next run.
 
 ### 2.7 ImageSetConfiguration
 
@@ -403,7 +425,7 @@ mirror:
 
 **Channel names** are publisher-defined labels (e.g. `release-2.13`, `stable`, `latest`). There is no global convention. Prefer the channel that matches your OCP support matrix; avoid relying on `latest` unless the vendor documents it for your version.
 
-**minVersion / maxVersion:** Omit `maxVersion` to allow future z-streams on the next run (floating head). Omit both to mirror only the channel head. If you set version bounds but do not name a channel, oc-mirror uses the package **default channel**, which is often not the one supported for your OCP version — always name the channel explicitly.
+**minVersion / maxVersion:** In current v2 behavior, omitting `maxVersion` keeps the lower bound while allowing newer z-stream content in later runs. Omitting both typically mirrors channel head behavior for the selected scope. Validate on your exact binary with `oc-mirror --v2 --help`. If you set version bounds but do not name a channel, oc-mirror can use the package **default channel**, which is sometimes not the one supported for your OCP version — always name the channel explicitly.
 
 **additionalImages** — For non-operator OCI images (e.g. app base images) that must be available in the disconnected environment. Plain image copies; no OLM semantics.
 
@@ -498,9 +520,9 @@ If you hear "`skipVersion`", read it as `skipRange` in FBC metadata. The practic
 oc get clusterversion version -o jsonpath='{.status.desired.version}{"\n"}'
 ```
 
-2. Open the operator product documentation and find its supportability/compatibility matrix.
-3. Match your OCP minor to the supported operator channel and target version.
-4. Record that channel/version pair and use it as the boundary for the steps below.
+1. Open the operator product documentation and find its supportability/compatibility matrix.
+2. Match your OCP minor to the supported operator channel and target version.
+3. Record that channel/version pair and use it as the boundary for the steps below.
 
 **Recommended workflow:**
 
