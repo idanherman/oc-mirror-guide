@@ -1,5 +1,7 @@
 # OpenShift OLM Field Guide for Disconnected Environments
 
+**Last updated:** 2025-03-11 · **Document version:** 1.1
+
 This guide is for Red Hat consultants and customer platform teams who need to mirror and upgrade OLM-based operators in disconnected or air-gapped OpenShift environments. It focuses on the part that usually causes real project delays: decision quality. In air-gap programs, every mirror run has cost (time, bandwidth, media handling, security review, and change windows), so the goal is not to mirror everything. The goal is to mirror exactly what your cluster needs, on a supported path, with predictable operational outcomes.
 
 The official OpenShift and `oc-mirror` documentation already defines supported commands, schemas, and workflows. This guide is a companion to those references and focuses on practical execution choices:
@@ -22,6 +24,14 @@ The official OpenShift and `oc-mirror` documentation already defines supported c
 - use **Section 3** for minimal-version mirroring (`skipRange` + path solver)
 - use **Section 4** for cluster-side install/upgrade actions
 - treat examples as templates and always validate channel/version decisions against your product support matrix
+
+**Table of contents**
+
+- [1. Foundations](#1-foundations) — Terminology, OLM flow, mental model
+- [2. oc-mirror](#2-oc-mirror) — Setup, workflows (m2d, d2m, m2m), ImageSetConfiguration, troubleshooting
+- [3. Mirror only required versions](#3-mirror-only-required-versions-skiprange-and-use-the-path-solver) — skipRange and path solver
+- [4. Install/upgrade with a mirrored catalog](#4-installupgrade-an-existing-operator-with-a-mirrored-catalog) — Cluster-side apply order and subscription
+- [5. References](#5-references)
 
 ---
 
@@ -127,7 +137,7 @@ Bundle/CSV selection is resolved from channel metadata at runtime: by default OL
 
 The Catalog Operator watches `Subscription`s and resolves them to an `InstallPlan`.
 
-#### 1.1.8 `InstallPlan` 
+#### 1.1.8 `InstallPlan`
 
 An **`InstallPlan`** is a Catalog Operator resource listing what should be installed for a resolved subscription.
 
@@ -225,8 +235,6 @@ flowchart TB
   L --> M
 ```
 
-
-
 **Notes:**
 
 - The **Catalog Operator** is responsible for `Subscription` resolution, catalog queries, bundle unpack Job, `InstallPlan` creation, and execution of approved `InstallPlan`s (resource creation such as `CRD`s and `CSV`s).
@@ -237,7 +245,6 @@ flowchart TB
 ---
 
 ### 1.3 Mental model
-
 
 | Concept                                | One-line mental model                                                                                                     |
 | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
@@ -253,10 +260,11 @@ flowchart TB
 | **`CSV`**                              | Installable operator-version record that defines install strategy and required APIs.                                      |
 | **OLM**                                | Catalog Operator resolves + executes approved plans; OLM Operator reconciles CSV install strategy into runtime resources. |
 
-
 ---
 
 ## 2. oc-mirror
+
+Key terms (Operator, Package, Catalog, ImageSetConfiguration, etc.) are defined in **Section 1**.
 
 oc-mirror is the supported Red Hat tool for copying OpenShift and operator content from external registries (such as `registry.redhat.io`) into your own registry or onto disk. In disconnected or air-gapped environments, clusters cannot pull images from the internet; oc-mirror runs on a connected host (or bastion) to mirror the content you need, so you can then move it across the boundary and serve it from an internal registry.
 
@@ -268,12 +276,11 @@ oc-mirror uses a single declarative **ImageSetConfiguration** file to decide wha
 - **Operator catalogs** — Catalog images (index images) and the bundle images they reference, so OLM on the disconnected cluster can install and upgrade operators.
 - **Additional images** — Arbitrary OCI images that your workloads need and that are not part of OLM.
 
-The tool does not install or configure the cluster; it only copies images and generates manifests (e.g. `ImageDigestMirrorSet`, `ImageTagMirrorSet`, `CatalogSource` or `ClusterCatalog`) that you apply on the cluster so it uses your internal registry.
+The tool does not install or configure the cluster; it only copies images and generates manifests (e.g. `ImageDigestMirrorSet`, `ImageTagMirrorSet`, `CatalogSource`, `ClusterCatalog`, and when mirroring platform content, `UpdateService`) that you apply on the cluster so it uses your internal registry.
 
 ### 2.2 Workflows: m2d, d2m, m2m
 
 Three workflows cover different connectivity patterns:
-
 
 | Workflow                   | When to use                                                    | What happens                                                                                                                                                                                     |
 | -------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -281,6 +288,7 @@ Three workflows cover different connectivity patterns:
 | **d2m (disk-to-mirror)**   | You are on the air-gapped side with the tarballs.              | oc-mirror reads the tarballs and pushes the images to your internal registry. No internet access required.                                                                                       |
 | **m2m (mirror-to-mirror)** | A host can reach both the internet and your internal registry. | oc-mirror copies directly from the source registry to your registry. No tarballs or physical transfer.                                                                                           |
 
+**Destination prefixes:** For **m2d** the destination uses the `file://` prefix (local directory). For **d2m** and **m2m** the destination uses the `docker://` prefix (container registry).
 
 For a full air-gap, you typically run **m2d** on a connected machine, transfer the tarballs, then run **d2m** on a host inside the secure network. If you have a bastion that can see both sides, **m2m** avoids the intermediate disk step.
 
@@ -291,6 +299,8 @@ For a full air-gap, you typically run **m2d** on a connected machine, transfer t
 #### 2.3.1 Obtain the binary
 
 Download oc-mirror from the [Red Hat Hybrid Cloud Console](https://console.redhat.com/openshift/downloads): **OpenShift disconnected installation tools** → **OpenShift Client (oc) mirror plugin** → choose your OS and architecture → Download.
+
+On **aarch64**, **ppc64le**, and **s390x**, oc-mirror v2 is supported only for OpenShift Container Platform 4.14 and later.
 
 The binary is not tied to a single OCP minor version. The coupling to a specific release is in your **ImageSetConfiguration** (e.g. which catalog image tag you use, such as `redhat-operator-index:v4.18`). Use the build that your OpenShift toolchain policy expects and confirm behavior with:
 
@@ -307,7 +317,7 @@ You will see both `oc-mirror` and `oc mirror` in documentation. They use the sam
 
 #### 2.3.3 Use v2
 
-oc-mirror v1 is deprecated as of OCP 4.18 and will be removed in a future release. For all mirroring (m2d, d2m, m2m), use **v2**:
+oc-mirror v1 was deprecated in OCP 4.18 and will be removed in a future release. For all mirroring (m2d, d2m, m2m), use **v2**:
 
 - Pass `--v2` on the command line.
 - Use `apiVersion: mirror.openshift.io/v2alpha1` in your ImageSetConfiguration.
@@ -363,7 +373,7 @@ oc-mirror --authfile /etc/mirror/pull-secret -c config.yaml file:///mirror-dir -
 Before you run oc-mirror you need:
 
 1. **ImageSetConfiguration** — A YAML file (e.g. `config.yaml`) that specifies what to mirror: platform channels, operator catalogs and packages/channels/versions, and any additional images. See section 2.7 for how to define it.
-2. **Destination** — For **m2d**: a local directory path (e.g. `file:///mnt/usb/mirror-dir`). For **d2m** or **m2m**: a registry URL (e.g. `docker://registry.example.com:5000`).
+2. **Destination** — For **m2d**: a local directory path with the `file://` prefix (e.g. `file:///mnt/usb/mirror-dir`). For **d2m** or **m2m**: a registry URL with the `docker://` prefix (e.g. `docker://registry.example.com:5000`).
 3. **Credentials** — Auth file for the source registry (and for d2m/m2m, access to the destination registry as needed).
 
 After a successful run, oc-mirror writes tarballs (m2d) and/or pushes images (d2m, m2m) and generates cluster resources (mirror sets, `CatalogSource` or `ClusterCatalog`, etc.) that you apply on the cluster so it uses the mirrored content.
@@ -396,7 +406,7 @@ Do not confuse these two directories:
 
 ### 2.7 ImageSetConfiguration
 
-The ImageSetConfiguration is the single YAML file that tells oc-mirror what to mirror. Correct configuration keeps runs small and predictable.
+The ImageSetConfiguration is the single YAML file that tells oc-mirror what to mirror. It can also include **Helm** repositories and local charts (see the [oc-mirror README](https://github.com/openshift/oc-mirror/blob/main/README.md) for the schema). Correct configuration keeps runs small and predictable.
 
 **Minimal structure:**
 
@@ -427,7 +437,7 @@ mirror:
 
 **minVersion / maxVersion:** In current v2 behavior, omitting `maxVersion` keeps the lower bound while allowing newer z-stream content in later runs. Omitting both typically mirrors channel head behavior for the selected scope. Validate on your exact binary with `oc-mirror --v2 --help`. If you set version bounds but do not name a channel, oc-mirror can use the package **default channel**, which is sometimes not the one supported for your OCP version — always name the channel explicitly.
 
-**additionalImages** — For non-operator OCI images (e.g. app base images) that must be available in the disconnected environment. Plain image copies; no OLM semantics.
+**additionalImages** — For non-operator OCI images (e.g. app base images) that must be available in the disconnected environment. Plain image copies; no OLM semantics. **You must use explicit registry hostnames** for every image listed under `additionalImages` (e.g. `quay.io/org/image:tag` or `registry.redhat.io/ubi8/ubi:latest`). Otherwise oc-mirror v2 can mirror them to incorrect target paths.
 
 ### 2.8 Advanced version-selection workflow
 
@@ -437,14 +447,12 @@ Detailed minimal-version planning (`skipRange`, `opm render`, and the path solve
 
 **m2d (connected):** Destination is `file:///path/to/mirror-dir`. Output: `mirror_seq1_000000.tar` (and more for large runs) plus `working-dir/` (metadata, sequence state, cluster-resources). Transfer **only the tarballs**; leave `working-dir/` behind. It is regenerated when you run d2m.
 
-
 | What              | Transfer? |
 | ----------------- | --------- |
 | `mirror_seq*.tar` | **Yes**   |
 | `working-dir/`    | **No**    |
 
-
-**d2m (air-gapped):** Copy tarballs to the host, then:
+**d2m (air-gapped):** Copy tarballs to the host. The `--from` argument must point to the directory that *contains* the `mirror_seq*.tar` files (not to `working-dir/`). Then:
 
 ```bash
 oc-mirror -c imagesetconfig.yaml \
@@ -453,7 +461,7 @@ oc-mirror -c imagesetconfig.yaml \
   --v2 --retry-times 3
 ```
 
-oc-mirror reads the tarballs, recreates `working-dir/`, and pushes to the registry.
+oc-mirror reads the tarballs from that directory, recreates `working-dir/` locally, and pushes the images to the registry.
 
 **m2m (bastion):** Use `--workspace file:///path/to/workspace` and a `docker://` destination. No tarballs; content goes straight to the registry. The workspace holds only metadata.
 
@@ -470,11 +478,10 @@ Detailed cluster-side apply order, catalog retagging, and `Subscription` switch 
 3. Run m2d with `--v2 --retry-times 5 --image-timeout 1h` (and `--authfile` if needed).
 4. Transfer only `mirror_seq*.tar` to the air-gapped side.
 5. Run d2m with `--from file:///path/to/tarballs` and `docker://your-registry`.
-6. Apply IDMS and ITMS, wait for MCP rollout, then apply the generated catalog manifest (or create a new `CatalogSource` for a full index).
+6. Apply cluster resources in order (see Section 4): IDMS and ITMS, wait for Machine Config Pool (MCP) rollout, then apply signature ConfigMap (if you mirrored release images), then catalog and UpdateService manifests.
 7. Update the `Subscription` (channel, source, `installPlanApproval`, `startingCSV` if desired) and approve the `InstallPlan`.
 
 ### 2.12 Troubleshooting
-
 
 | Symptom                                               | Likely cause                                               | Fix                                                                                            |
 | ----------------------------------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
@@ -484,29 +491,38 @@ Detailed cluster-side apply order, catalog retagging, and `Subscription` switch 
 | Catalog pod ImagePullBackOff (disconnected)           | Mirror redirects not applied first or MCP not updated      | Apply idms/itms YAMLs, wait for MCP rollout, then re-apply catalog                             |
 | Operator tile present but install fails on image pull | Full index but not all packages mirrored                   | Use a separate `CatalogSource` for the mirrored subset (retag and new `CatalogSource`)         |
 | OLM does not offer expected upgrade                   | Wrong channel, unsupported channel, or target not mirrored | Align `Subscription` channel with support matrix; confirm target bundle is in mirrored catalog |
-
+| Ran `oc-mirror delete` but registry size unchanged   | Only manifests were removed; blobs remain until GC runs    | Run your registry's garbage collector to reclaim storage; see official docs for your registry   |
 
 ### 2.13 Quick reference (flags)
 
-
-| Flag                | Purpose                         | When to use                            |
-| ------------------- | ------------------------------- | -------------------------------------- |
-| `--v2`              | Use v2 behavior                 | Always                                 |
-| `--retry-times N`   | Retry failed pulls N times      | Production; set at least 3–5           |
-| `--image-timeout D` | Per-image timeout (`10m`, `1h`) | Slow links or large images             |
-| `--authfile`        | Auth file path                  | Non-default credential location        |
-| `--from`            | Source directory for d2m        | Air-gap: directory containing tarballs |
-| `--workspace`       | Metadata workspace for m2m      | Bastion m2m runs                       |
-| `--since`           | Only content newer than date    | Incremental runs                       |
-| `--cache-dir`       | Override cache location         | Custom layout or shared systems        |
-
+| Flag                  | Purpose                                   | When to use                            |
+| --------------------- | ----------------------------------------- | -------------------------------------- |
+| `--v2`                | Use v2 behavior                           | Always                                 |
+| `--retry-times N`     | Retry failed pulls N times                | Production; set at least 3–5           |
+| `--image-timeout D`   | Per-image timeout (`10m`, `1h`)           | Slow links or large images             |
+| `--authfile`          | Auth file path                            | Non-default credential location        |
+| `--from`              | Source directory for d2m                  | Air-gap: directory containing tarballs |
+| `--workspace`         | Metadata workspace for m2m               | Bastion m2m runs                       |
+| `--since`             | Only content newer than date              | Incremental runs                       |
+| `--cache-dir`         | Override cache location                   | Custom layout or shared systems        |
+| `--dry-run`           | Print actions without mirroring           | Validate config and destination        |
+| `--parallel-images N` | Images mirrored in parallel (default 8)  | Tuning for fast links or throttled registries |
+| `--parallel-layers N` | Layers per image in parallel (default 10) | Tuning for large images                |
+| `--strict-archive`    | Fail if an archive exceeds configured size | When using `archiveSize` in ImageSetConfiguration |
 
 ### 2.14 Caveats
 
 - **skipDependencies** in ImageSetConfiguration is not a safe substitute for testing; validate in pre-production if you rely on dependency trimming.
 - **Catalog default channel** often targets a newer OCP than yours. Always set the `Subscription` channel from the product support matrix.
-- **Mirror redirect (IDMS/ITMS) rollout** triggers a MachineConfig change and rolling node restart (30+ minutes on large clusters). Apply catalog only after rollout completes.
+- **Mirror redirect (IDMS/ITMS) rollout** triggers a Machine Config Pool (MCP) change and rolling node restart (30+ minutes on large clusters). Apply catalog only after MCP rollout completes.
 - **v1 is deprecated.** Use `opm render` (and path solver) for real workflows; reserve `oc mirror list operators --v1` for quick exploration only.
+- **Enclave / multi-registry:** For mirroring to multiple enclaves or custom registry configuration (e.g. signature storage), see [Enclave support](https://github.com/openshift/oc-mirror/blob/main/v2/docs/features/enclave_support.md) and the `--registries.d` flag in the oc-mirror README.
+
+### 2.15 Delete subcommand and catalog pinning
+
+**Deleting images from the mirror registry:** oc-mirror v2 does not auto-prune. To remove images you no longer need, use the `oc-mirror delete` subcommand in two phases: (1) with a `DeleteImageSetConfiguration` and `--generate`, oc-mirror produces a delete-images YAML; (2) run `oc-mirror delete --delete-yaml-file <path>` to remove manifests from the registry. Only manifests are deleted; run your registry's **garbage collector** to reclaim blob storage. See the [Disconnected environments documentation](https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html-single/disconnected_environments/#delete-mirror-registry-content) for the full procedure.
+
+**Catalog pinning:** After mirror-to-disk or mirror-to-mirror runs, oc-mirror can write pinned configs (`isc_pinned_{timestamp}.yaml` and `disc_pinned_{timestamp}.yaml`) in the working directory. These reference catalogs by digest for reproducible mirrors and for use with the delete flow. See the [oc-mirror README — Catalog Pinning](https://github.com/openshift/oc-mirror/blob/main/README.md).
 
 ## 3. Mirror only required versions (`skipRange`) and use the path solver
 
@@ -520,9 +536,9 @@ If you hear "`skipVersion`", read it as `skipRange` in FBC metadata. The practic
 oc get clusterversion version -o jsonpath='{.status.desired.version}{"\n"}'
 ```
 
-1. Open the operator product documentation and find its supportability/compatibility matrix.
-2. Match your OCP minor to the supported operator channel and target version.
-3. Record that channel/version pair and use it as the boundary for the steps below.
+2. Open the operator product documentation and find its supportability/compatibility matrix.
+3. Match your OCP minor to the supported operator channel and target version.
+4. Record that channel/version pair and use it as the boundary for the steps below.
 
 **Recommended workflow:**
 
@@ -532,7 +548,7 @@ oc get clusterversion version -o jsonpath='{.status.desired.version}{"\n"}'
 opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 > catalog.json
 ```
 
-1. Compute the shortest valid hop path:
+2. Compute the shortest valid hop path using the path solver script. The script is provided in this repo as `resolve-operator-path.sh` (same directory as this guide). It requires **Bash 4+** and **jq**:
 
 ```bash
 ./resolve-operator-path.sh \
@@ -543,21 +559,29 @@ opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 > catalog.json
   registry.redhat.io/redhat/redhat-operator-index:v4.18
 ```
 
-1. Use the generated ImageSetConfiguration snippet as your base and keep `minVersion` only if you want floating heads in that channel.
-2. Add `maxVersion` only if you need exact pinning for change-control.
-3. Keep channel choice aligned with the support matrix for your OCP version.
-4. Mirror and publish as usual (`m2d`/`d2m` or `m2m`), then verify the target bundle is actually present in your mirrored catalog.
+3. Use the generated ImageSetConfiguration snippet as your base and keep `minVersion` only if you want floating heads in that channel.
+4. Add `maxVersion` only if you need exact pinning for change-control.
+5. Keep channel choice aligned with the support matrix for your OCP version.
+6. Mirror and publish as usual (`m2d`/`d2m` or `m2m`), then verify the target bundle is actually present in your mirrored catalog.
 
 ## 4. Install/upgrade an existing operator with a mirrored catalog
 
-This section is the practical "cluster-side" procedure after mirror publish.
+This section is the practical "cluster-side" procedure after mirror publish. Terms used here are defined in **Section 1.1**.
 
-1. Apply mirror redirects first (`idms.yaml`, `itms.yaml`) and wait for MCP rollout completion.
-2. Publish catalog metadata for operators.
-3. If `clusterCatalog.yaml` is generated, use it as authoritative for that environment.
-4. If using `CatalogSource`, prefer creating a dedicated mirrored source instead of replacing the default `redhat-operators`.
-5. Retag the mirrored index to an immutable operational tag (for example with date/version) and point your mirrored `CatalogSource` to that exact tag.
-6. Update the operator `Subscription` to use the mirrored source and supported channel.
+**Apply generated resources in this order:**
+
+1. **ImageDigestMirrorSet (IDMS) and ImageTagMirrorSet (ITMS)** — Apply the generated `idms.yaml` and `itms.yaml` from `working-dir/cluster-resources/`.
+2. **Wait for Machine Config Pool (MCP) rollout** — Mirror redirects trigger a MachineConfig change and rolling node restart (often 30+ minutes on large clusters). Do not apply catalog resources until rollout completes.
+3. **Release image signatures (if you mirrored platform/release images)** — Apply `working-dir/cluster-resources/signature-configmap.json` (or the YAML equivalent). **Do not** apply the signature ConfigMap when you mirrored only Operators; that scenario has no release image signatures and the command would error.
+4. **Catalog metadata** — Apply the generated `CatalogSource` and/or `ClusterCatalog` manifests (or create a dedicated mirrored source as below). If **UpdateService** was generated (e.g. you set `graph: true` for platform mirroring), apply it from the same `cluster-resources` directory.
+5. **Do not modify** the fields that oc-mirror generated in these resources (e.g. `spec.image` on CatalogSource, `spec.imageDigestMirrors` on IDMS). See the [official documentation — Restrictions on modifying resources](https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html-single/disconnected_environments/#restrictions-modifying-resources-generated-oc-mirror_disconnected-environments) for the full list.
+
+Then proceed with catalog publishing and subscription:
+
+6. If `clusterCatalog.yaml` is generated, use it as authoritative for that environment.
+7. If using `CatalogSource`, prefer creating a dedicated mirrored source instead of replacing the default `redhat-operators`.
+8. Retag the mirrored index to an immutable operational tag (for example with date/version) and point your mirrored `CatalogSource` to that exact tag.
+9. Update the operator `Subscription` to use the mirrored source and supported channel.
 
 ```bash
 oc -n <operator-namespace> patch subscription <subscription-name> \
@@ -570,8 +594,8 @@ oc -n <operator-namespace> patch subscription <subscription-name> \
   }}'
 ```
 
-1. If you must force an initial target, set `startingCSV` explicitly in the subscription spec.
-2. Approve the pending `InstallPlan` (if manual), then verify resulting `CSV` phase and operator deployment health.
+10. If you must force an initial target, set `startingCSV` explicitly in the subscription spec.
+11. Approve the pending `InstallPlan` (if manual), then verify resulting `CSV` phase and operator deployment health.
 
 ```bash
 oc get installplan -n <operator-namespace>
@@ -580,13 +604,14 @@ oc patch installplan <plan-name> -n <operator-namespace> \
 oc get csv -n <operator-namespace>
 ```
 
-1. Keep old mirrored catalog tags until validation is complete; then prune intentionally.
+12. Keep old mirrored catalog tags until validation is complete; then prune intentionally.
 
 ## 5. References
 
 - [oc-mirror README (v2)](https://github.com/openshift/oc-mirror/blob/main/README.md)
 - [oc-mirror on GitHub](https://github.com/openshift/oc-mirror)
-- [OCP Disconnected installation mirroring](https://docs.openshift.com/container-platform/latest/installing/disconnected_install/installing-mirroring-disconnected.html)
+- [Mirroring images for a disconnected installation using the oc-mirror plugin v2](https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html-single/disconnected_environments/#mirroring-images-disconnected-installation-oc-mirror-plugin-v2_disconnected-environments) (official chapter)
+- [OCP Disconnected installation mirroring](https://docs.openshift.com/container-platform/latest/installing/disconnected_install/installing-mirroring-disconnected.html) — [versioned (4.18)](https://docs.openshift.com/container-platform/4.18/installing/disconnected_install/installing-mirroring-disconnected.html)
 - [OCP Operator Upgrade Information (OUIC)](https://access.redhat.com/labs/ocpouic/)
 - [Red Hat solution 7061405 — EUS shortest path and oc-mirror](https://access.redhat.com/solutions/7061405)
 - [File-based catalogs (OLM)](https://olm.operatorframework.io/docs/reference/file-based-catalogs/)
