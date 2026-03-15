@@ -168,20 +168,6 @@ You will typically see `catalog-operator` and `olm-operator` pods in the `opensh
 
 When you create a `Subscription`, OLM does not immediately start operator pods. It first resolves *what* should be installed, then unpacks the selected bundle, creates the install resources, and only then starts the runtime workload.
 
-The practical flow is:
-
-1. You create a `Subscription`, either with `oc apply` or through the web console in **OperatorHub**, and the API server stores it in etcd.
-2. The `Subscription` points to a specific catalog object through `spec.source` / `spec.sourceNamespace` (for `CatalogSource`) or the equivalent catalog reference in newer flows. The **Catalog Operator** watches the `Subscription`, reads that reference, and connects to that catalog service specifically rather than to "all catalogs".
-3. The catalog service is exposed by the pod that was created from the mirrored catalog image referenced by the `CatalogSource` or `ClusterCatalog`. Inside that pod, the catalog content is served over gRPC. The **Catalog Operator** queries that gRPC API for the subscribed package and channel.
-4. During that query, the **Catalog Operator** resolves the upgrade graph using the currently installed operator state on the cluster and the channel metadata in the catalog. In practice, it compares the installed CSV/version to the channel entries and their `replaces`, `skips`, and `skipRange` metadata. If the channel head is directly reachable, it can target the head immediately. If not, it selects the required bridge bundle first, and after that bridge installs successfully, the graph is resolved again for the next hop.
-5. The catalog service returns the selected bundle metadata for the next hop, including the bundle image reference, properties, dependency metadata, and install manifests metadata.
-6. The **Catalog Operator** creates a bundle unpack Job for that selected bundle image. The unpack pod pulls the bundle image, reads the bundle contents, and extracts the manifests stored inside it, typically the `ClusterServiceVersion` plus any included `CRD`s and related metadata. That unpacked content is written into a `ConfigMap`.
-7. The **Catalog Operator** reads the unpacked `ConfigMap` content and uses it to build an `InstallPlan`. If the subscription is `Manual`, the `InstallPlan` is created but waits until you approve it.
-8. Once the `InstallPlan` is approved, the **Catalog Operator** executes it and creates install-time resources such as `CRD`s and the target `CSV` for that hop.
-9. The **OLM Operator** watches the new `CSV`, checks `OperatorGroup` membership and other requirements, and then runs the CSV install strategy.
-10. That install strategy creates the runtime resources such as `Deployment`s, service accounts, and RBAC.
-11. The Kubernetes controllers then reconcile those resources and start the operator pods using the runtime image referenced by the `CSV`. If the overall upgrade requires another hop, the **Catalog Operator** resolves the graph again from the newly installed CSV and repeats the process.
-
 The diagrams below break that sequence into stages. Each stage includes a short explanation first, and the diagram is there to show both the control flow and the important containment relationships inside the catalog pod, unpack Job, and runtime resources. Component names (Catalog Operator vs OLM Operator) match OpenShift's actual controllers.
 
 **Stage 1: Subscription to graph resolution**
@@ -664,6 +650,35 @@ This section is the practical "cluster-side" procedure after mirror publish. Ter
    - give each mirrored catalog image a new, stable tag in your registry (for example by date, run number, or operator scope)
    - create or update a dedicated `CatalogSource` or `ClusterCatalog` that points `spec.image` at that exact retagged image
    - give the API resource a unique name as well, so applying a later run does not replace the older catalog resource unintentionally
+
+   In practice, an oc-mirror `d2m` or `m2m` run pushes the catalog image into your internal registry under the default generated repository/tag path for that run. If you leave that image reference "as is", a later mirror run can push a newer catalog image to the same destination and silently replace the previous catalog content. To preserve an older catalog for rollback or side-by-side testing, retag it to a new stable tag either:
+   - immediately after the current `d2m` run completes, or
+   - before you let a later `d2m` run reuse that default catalog destination
+
+   Example with `podman`:
+
+```bash
+podman pull registry.example.com:5000/redhat/redhat-operator-index:v4.16
+podman tag \
+  registry.example.com:5000/redhat/redhat-operator-index:v4.16 \
+  registry.example.com:5000/redhat/redhat-operator-index:acm-mce-gitops-2026-03-15
+podman push registry.example.com:5000/redhat/redhat-operator-index:acm-mce-gitops-2026-03-15
+```
+
+   Example mirrored catalog object after retagging:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: redhat-operators-acm-mce-gitops-2026-03-15
+  namespace: openshift-marketplace
+spec:
+  sourceType: grpc
+  image: registry.example.com:5000/redhat/redhat-operator-index:acm-mce-gitops-2026-03-15
+  displayName: Red Hat Operators (ACM/MCE/GitOps 2026-03-15)
+  publisher: Red Hat
+```
 
 3. **Use the new catalog explicitly in the operator `Subscription`** — If the operator is currently subscribed to an older mirrored catalog, patch the `Subscription` so it points to the new `CatalogSource` first. Then set the supported target channel and keep `installPlanApproval: Manual`. If the `Subscription` still points to the previous catalog, OLM will continue resolving from that older catalog and the new bundles will not be used.
 
