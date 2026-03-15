@@ -182,51 +182,99 @@ The practical flow is:
 10. That install strategy creates the runtime resources such as `Deployment`s, service accounts, and RBAC.
 11. The Kubernetes controllers then reconcile those resources and start the operator pods using the runtime image referenced by the `CSV`. If the overall upgrade requires another hop, the **Catalog Operator** resolves the graph again from the newly installed CSV and repeats the process.
 
-The diagrams below break that sequence into stages. Component names (Catalog Operator vs OLM Operator) match OpenShift's actual controllers.
+The diagrams below break that sequence into stages. Each stage includes a short explanation first, and the diagram is there to show both the control flow and the important containment relationships inside the catalog pod, unpack Job, and runtime resources. Component names (Catalog Operator vs OLM Operator) match OpenShift's actual controllers.
 
 **Stage 1: Subscription to graph resolution**
 
-```mermaid
-flowchart LR
-  A["User creates Subscription<br/>via oc or OperatorHub"]
-  B["API server / etcd<br/>stores Subscription"]
-  C["Catalog Operator<br/>watches Subscription"]
-  D["Catalog Operator reads<br/>source/sourceNamespace"]
-  E["CatalogSource or ClusterCatalog pod<br/>serves catalog over gRPC"]
-  F["Catalog Operator resolves next hop<br/>using installed CSV + channel graph"]
+The first stage is about **resolution**, not installation. The `Subscription` points to a specific catalog source. The **Catalog Operator** reads that reference, connects to the catalog pod created from the mirrored catalog image, and queries the package/channel data served from the catalog contents. At this point OLM decides whether the next hop is the channel head or an intermediate bridge bundle.
 
-  A --> B --> C --> D --> E --> F
+```mermaid
+flowchart TB
+  subgraph cluster["Cluster API and controllers"]
+    A["User creates Subscription<br/>via oc or OperatorHub"]
+    B["API server / etcd stores:<br/>Subscription + installed CSV state"]
+    C["Catalog Operator watches Subscription"]
+    D["Catalog Operator reads<br/>spec.source / sourceNamespace"]
+    F["Catalog Operator resolves next hop<br/>using installed CSV + channel graph"]
+  end
+
+  subgraph catalog_source["Referenced catalog source"]
+    CS["CatalogSource / ClusterCatalog resource"]
+    subgraph catalog_pod["Catalog pod created from mirrored catalog image"]
+      IMG["Catalog image"]
+      subgraph fbc["FBC content inside the image"]
+        PKG["olm.package"]
+        CH["olm.channel entries"]
+        BND["olm.bundle metadata"]
+      end
+      GRPC["gRPC catalog service"]
+    end
+  end
+
+  A --> B --> C --> D --> CS --> GRPC --> F
+  IMG --> fbc --> GRPC
 ```
 
 **Stage 2: Selected bundle to InstallPlan**
 
-```mermaid
-flowchart LR
-  A["Catalog Operator selects<br/>target or bridge bundle"]
-  B["Catalog Operator creates<br/>bundle unpack Job"]
-  C["Unpack pod pulls bundle image"]
-  D["Unpack pod extracts CSV/CRDs/metadata<br/>into a ConfigMap"]
-  E["Catalog Operator reads ConfigMap"]
-  F["Catalog Operator creates InstallPlan"]
-  G["Manual approval waits here<br/>if enabled"]
+Once the next hop is chosen, the **Catalog Operator** creates a bundle unpack Job for that specific selected bundle, whether it is the final target or an intermediate bridge. The unpack pod pulls the bundle image, reads the manifests embedded inside it, and writes the unpacked content into a `ConfigMap`. The **Catalog Operator** then reads that `ConfigMap` and builds the `InstallPlan`.
 
-  A --> B --> C --> D --> E --> F --> G
+```mermaid
+flowchart TB
+  A["Catalog Operator selects next hop<br/>(target bundle or bridge bundle)"]
+
+  subgraph unpack_job["Bundle unpack Job"]
+    J["Job resource"]
+    P["Unpack pod"]
+    BIMG["Selected bundle image"]
+    subgraph bundle_contents["Content inside the bundle image"]
+      CSV["ClusterServiceVersion"]
+      CRDS["CRDs"]
+      META["Annotations / properties / metadata"]
+    end
+  end
+
+  CM["ConfigMap with unpacked manifests"]
+  IP["InstallPlan created by Catalog Operator"]
+  MAN["Manual approval gate<br/>if Subscription is Manual"]
+
+  A --> J --> P --> BIMG
+  BIMG --> bundle_contents --> CM --> IP --> MAN
 ```
 
 **Stage 3: InstallPlan to running operator**
 
-```mermaid
-flowchart LR
-  A["Approved InstallPlan"]
-  B["Catalog Operator creates<br/>CRDs and CSV"]
-  C["OLM Operator watches CSV"]
-  D["OLM Operator validates<br/>OperatorGroup and requirements"]
-  E["OLM Operator runs CSV install strategy"]
-  F["Deployment / RBAC / ServiceAccount<br/>resources are created"]
-  G["Kubernetes controllers start operator pods<br/>from the CSV runtime image"]
-  H["If another hop is needed,<br/>Catalog Operator resolves again"]
+After approval, the **Catalog Operator** executes the `InstallPlan` and creates the install-time API resources for that hop. Then the **OLM Operator** takes over, reconciles the `CSV`, runs the install strategy, and creates the runtime resources that Kubernetes uses to start the actual operator pods. If the upgrade needs another hop, the process returns to Stage 1 and resolves again from the newly installed CSV.
 
-  A --> B --> C --> D --> E --> F --> G --> H
+```mermaid
+flowchart TB
+  A["Approved InstallPlan"]
+  B["Catalog Operator creates install-time resources<br/>including CRDs and CSV"]
+  C["OLM Operator watches CSV"]
+  D["OLM Operator validates OperatorGroup<br/>and other CSV requirements"]
+
+  subgraph csv_install["CSV install strategy"]
+    STRAT["Install strategy in CSV"]
+    DEP["Deployment"]
+    SA["ServiceAccount"]
+    RBAC["Roles / RoleBindings / ClusterRoles"]
+  end
+
+  subgraph runtime["Runtime after reconciliation"]
+    RS["ReplicaSet / controller reconciliation"]
+    POD["Running operator pods"]
+    RTIMG["Runtime image referenced by CSV"]
+  end
+
+  H["If another hop is needed,<br/>Catalog Operator resolves again from the newly installed CSV"]
+
+  A --> B --> C --> D --> STRAT
+  STRAT --> DEP
+  STRAT --> SA
+  STRAT --> RBAC
+  DEP --> RS --> POD
+  RTIMG --> POD
+  POD --> H
 ```
 
 **Notes:**
