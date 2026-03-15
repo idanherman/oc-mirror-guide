@@ -166,7 +166,21 @@ You will typically see `catalog-operator` and `olm-operator` pods in the `opensh
 
 ### 1.2 OLM installation flow (Subscription to running operator)
 
-The following flow describes what happens when you create a `Subscription` and OLM installs an operator. Component names (Catalog Operator vs OLM Operator) match OpenShift's actual controllers.
+When you create a `Subscription`, OLM does not immediately start operator pods. It first resolves *what* should be installed, then unpacks the selected bundle, creates the install resources, and only then starts the runtime workload.
+
+The practical flow is:
+
+1. You create a `Subscription`, and the API server stores it.
+2. The **Catalog Operator** notices the `Subscription` and queries the catalog service exposed by the `CatalogSource` or `ClusterCatalog` pod.
+3. The catalog service returns the selected bundle metadata, including the bundle image reference and upgrade metadata.
+4. The **Catalog Operator** creates a bundle unpack Job. That Job pulls the bundle image and extracts its manifests into a `ConfigMap`.
+5. Using that unpacked content, the **Catalog Operator** creates an `InstallPlan`. If the subscription is `Manual`, the plan waits until you approve it.
+6. Once the `InstallPlan` is approved, the **Catalog Operator** creates install-time resources such as `CRD`s and the target `CSV`.
+7. The **OLM Operator** then reconciles the `CSV`, checks `OperatorGroup` membership and requirements, and runs the CSV install strategy.
+8. That install strategy creates the runtime resources such as `Deployment`s, service accounts, and RBAC.
+9. The Kubernetes controllers then start the operator pods using the runtime image referenced by the `CSV`.
+
+The Mermaid diagram below is a visual supplement to that sequence. Component names (Catalog Operator vs OLM Operator) match OpenShift's actual controllers.
 
 ```mermaid
 flowchart TB
