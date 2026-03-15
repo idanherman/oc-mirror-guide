@@ -32,6 +32,20 @@ CURRENT_VER=$2
 TARGET_VER=$3
 CATALOG_FILE=$4
 CATALOG_IMAGE=${5:-registry.redhat.io/redhat/redhat-operator-index:v4.16}
+PACKAGE_DEFAULT_CHANNEL=$(jq -r --arg pkg "$OPERATOR" '
+  (if type == "array" then .[] else . end) |
+  select(.schema == "olm.package" and .name == $pkg) |
+  .defaultChannel // ""
+' "$CATALOG_FILE" | head -n1)
+
+if [[ "$CURRENT_VER" == "$TARGET_VER" ]]; then
+  echo "## No upgrade path required"
+  echo "----------------------------------------------------"
+  echo "$OPERATOR is already at target version $TARGET_VER"
+  echo "Nothing to mirror for an OLM-managed upgrade path."
+  echo "----------------------------------------------------"
+  exit 0
+fi
 
 # ==============================================================================
 # 1. EXTRACT DATA (Channel-Aware)
@@ -44,7 +58,7 @@ jq -r --arg pkg "$OPERATOR" '
   select(.schema == "olm.channel" and .package == $pkg) |
   .name as $chan |
   .entries[] |
-  [.name, $chan, (.replaces // ""), (.skipRange // "")] |
+  [.name, $chan, (.replaces // ""), ((.skips // []) | join(",")), (.skipRange // "")] |
   @tsv
 ' "$CATALOG_FILE" > "$TMP_GRAPH"
 
@@ -56,6 +70,7 @@ fi
 # Load into Memory
 declare -A NODE_CHANNEL
 declare -A NODE_REPLACES
+declare -A NODE_SKIPS
 declare -A NODE_SKIPRANGE
 declare -A NODE_VERSION
 ALL_ENTRY_IDS=()
@@ -66,7 +81,7 @@ short_ver_from_bundle() {
   printf '%s\n' "${bundle_name##*.v}"
 }
 
-while IFS=$'\t' read -r name channel replaces skipRange; do
+while IFS=$'\t' read -r name channel replaces skips skipRange; do
   [[ -z "$name" ]] && continue
 
   SHORT_VER=$(short_ver_from_bundle "$name")
@@ -74,6 +89,7 @@ while IFS=$'\t' read -r name channel replaces skipRange; do
 
   NODE_CHANNEL["$ENTRY_ID"]=$channel
   NODE_REPLACES["$ENTRY_ID"]=$replaces
+  NODE_SKIPS["$ENTRY_ID"]=$skips
   NODE_SKIPRANGE["$ENTRY_ID"]=$skipRange
   NODE_VERSION["$ENTRY_ID"]=$SHORT_VER
   ALL_ENTRY_IDS+=("$ENTRY_ID")
@@ -161,7 +177,22 @@ while [ ${#QUEUE[@]} -gt 0 ]; do
       if [[ "$CAND_REPLACES_SHORT" == "$CURRENT_SHORT" ]]; then IS_VALID_HOP=true; fi
     fi
 
-    # 2. Check SkipRange
+    # 2. Check Skips
+    if [ "$IS_VALID_HOP" = false ]; then
+       CAND_SKIPS=${NODE_SKIPS[$CANDIDATE]}
+       if [[ -n "$CAND_SKIPS" ]]; then
+         IFS=',' read -r -a SKIP_BUNDLES <<< "$CAND_SKIPS"
+         for SKIP_BUNDLE in "${SKIP_BUNDLES[@]}"; do
+           SKIP_SHORT=$(short_ver_from_bundle "$SKIP_BUNDLE")
+           if [[ "$SKIP_SHORT" == "$CURRENT_SHORT" ]]; then
+             IS_VALID_HOP=true
+             break
+           fi
+         done
+       fi
+    fi
+
+    # 3. Check SkipRange
     if [ "$IS_VALID_HOP" = false ]; then
        CAND_SKIP=${NODE_SKIPRANGE[$CANDIDATE]}
        if check_range "$CURRENT_SHORT" "$CAND_SKIP"; then IS_VALID_HOP=true; fi
@@ -219,7 +250,9 @@ echo "----------------------------------------------------"
 if [[ $# -lt 5 ]]; then
   echo "# Catalog image defaulted to ${CATALOG_IMAGE}. Pass it as the 5th argument to avoid editing this field."
 fi
-echo "# Output uses minVersion only (floating heads). Add maxVersion if you want an exact pin."
+echo "# The path above is the exact logical upgrade path derived from catalog metadata."
+echo "# The config below intentionally uses minVersion only, so stock oc-mirror can mirror a floating head from each retained channel."
+echo "# This means the emitted config is an approximation of the exact path, not an exact bundle pin."
 echo "kind: ImageSetConfiguration"
 echo "apiVersion: mirror.openshift.io/v2alpha1"
 echo "mirror:"
@@ -227,6 +260,39 @@ echo "  operators:"
 echo "    - catalog: $CATALOG_IMAGE"
 echo "      packages:"
 echo "        - name: $OPERATOR"
+
+OUTPUT_CHANNELS=()
+for (( i=${#FINAL_PATH[@]}-1; i>=0; i-- )); do
+  ENTRY_ID=${FINAL_PATH[$i]}
+  REAL_CHANNEL=${NODE_CHANNEL[$ENTRY_ID]}
+
+  if [[ "${#OUTPUT_CHANNELS[@]}" -eq 0 || "${OUTPUT_CHANNELS[${#OUTPUT_CHANNELS[@]}-1]}" != "$REAL_CHANNEL" ]]; then
+    OUTPUT_CHANNELS+=("$REAL_CHANNEL")
+  fi
+done
+
+FILTERED_DEFAULT_CHANNEL=""
+if [[ -n "$PACKAGE_DEFAULT_CHANNEL" ]]; then
+  DEFAULT_PRESENT=false
+  for REAL_CHANNEL in "${OUTPUT_CHANNELS[@]}"; do
+    if [[ "$REAL_CHANNEL" == "$PACKAGE_DEFAULT_CHANNEL" ]]; then
+      DEFAULT_PRESENT=true
+      break
+    fi
+  done
+
+  if [[ "$DEFAULT_PRESENT" == false && "${#OUTPUT_CHANNELS[@]}" -gt 0 ]]; then
+    FILTERED_DEFAULT_CHANNEL="${OUTPUT_CHANNELS[${#OUTPUT_CHANNELS[@]}-1]}"
+  fi
+fi
+
+if [[ -n "$FILTERED_DEFAULT_CHANNEL" ]]; then
+  echo "          defaultChannel: $FILTERED_DEFAULT_CHANNEL"
+  if [[ "${#OUTPUT_CHANNELS[@]}" -gt 1 ]]; then
+    echo "          # Multiple channels retained; keep Subscription.channel explicit during upgrades."
+  fi
+fi
+
 echo "          channels:"
 
 LAST_CHANNEL=""

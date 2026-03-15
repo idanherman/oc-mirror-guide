@@ -433,9 +433,9 @@ mirror:
 
 **Operators stanza (read left to right):** `catalog` → which index; `packages[].name` → which operator; `channels[].name` → which channel; `minVersion` / `maxVersion` → which versions. If you omit a level, oc-mirror chooses for you, which often leads to oversized mirrors.
 
-**Channel names** are publisher-defined labels (e.g. `release-2.13`, `stable`, `latest`). There is no global convention. Prefer the channel that matches your OCP support matrix; avoid relying on `latest` unless the vendor documents it for your version.
+**Channel names** are publisher-defined labels (e.g. `release-2.13`, `stable`, `latest`). There is no global convention. In disconnected environments, treat a channel primarily as an **upgrade-graph identifier**, not as a release-cadence promise. Prefer explicit stream channels when they exist (for example `release-2.13`, `stable-2.9`, `v1.0.x`) and avoid relying on generic aliases such as `stable` or `latest` unless the vendor documents them for your version.
 
-**minVersion / maxVersion:** In current v2 behavior, omitting `maxVersion` keeps the lower bound while allowing newer z-stream content in later runs. Omitting both typically mirrors channel head behavior for the selected scope. Validate on your exact binary with `oc-mirror --v2 --help`. If you set version bounds but do not name a channel, oc-mirror can use the package **default channel**, which is sometimes not the one supported for your OCP version — always name the channel explicitly.
+**minVersion / maxVersion:** In current v2 behavior, omitting `maxVersion` keeps the lower bound while allowing newer z-stream content in later runs. Omitting both typically mirrors channel head behavior for the selected scope. Validate on your exact binary with `oc-mirror --v2 --help`. If you set version bounds but do not name a channel, oc-mirror can use the package **default channel**, which is sometimes not the one supported for your OCP version — always name the channel explicitly. If your filtered channel set excludes the upstream package default, use the package `defaultChannel` field in the ImageSetConfiguration so the filtered catalog remains internally consistent.
 
 **additionalImages** — For non-operator OCI images (e.g. app base images) that must be available in the disconnected environment. Plain image copies; no OLM semantics. **You must use explicit registry hostnames** for every image listed under `additionalImages` (e.g. `quay.io/org/image:tag` or `registry.redhat.io/ubi8/ubi:latest`). Otherwise oc-mirror v2 can mirror them to incorrect target paths.
 
@@ -524,13 +524,13 @@ Detailed cluster-side apply order, catalog retagging, and `Subscription` switch 
 
 **Catalog pinning:** After mirror-to-disk or mirror-to-mirror runs, oc-mirror can write pinned configs (`isc_pinned_{timestamp}.yaml` and `disc_pinned_{timestamp}.yaml`) in the working directory. These reference catalogs by digest for reproducible mirrors and for use with the delete flow. See the [oc-mirror README — Catalog Pinning](https://github.com/openshift/oc-mirror/blob/main/README.md).
 
-## 3. Mirror only required versions (`skipRange`) and use the path solver
+## 3. Compute the minimal logical upgrade path (`skipRange`) and use the path solver
 
-If you hear "`skipVersion`", read it as `skipRange` in FBC metadata. The practical objective is to mirror only what is required for a valid upgrade path: instead of mirroring every bundle in a channel, you inspect the catalog’s upgrade edges (`replaces`, `skipRange`) and mirror only the bundles that lie on a valid path from your current version to your target version.
+If you hear "`skipVersion`", read it as `skipRange` in FBC metadata. The practical objective is to compute the **minimal logical upgrade path** from your current version to your supported target version. That path is derived from the catalog’s upgrade edges (`replaces`, `skips`, `skipRange`). Whether stock `oc-mirror` can represent that path *exactly* is a second question; in practice, the generated ImageSetConfiguration often uses `minVersion` to approximate the exact path with floating heads.
 
 ### 3.1 Why we need the catalog as JSON
 
-The catalog image (e.g. `redhat-operator-index:v4.18`) is an OCI image that holds **file-based catalog (FBC)** data: package definitions, channel definitions, and bundle metadata including upgrade edges. To decide *which* bundles to mirror, we need to query that metadata—e.g. “which channel is this package on?”, “what is the `skipRange` of the target bundle?”, “what is the chain of `replaces`?”. The catalog image itself is not directly queryable from the command line. We therefore **dump** the FBC content to a single, machine-readable file. The standard way to do that is to **render** the catalog; the renderer outputs a **stream of JSON objects** (one JSON object per FBC entity: package, channel, bundle). Saving that stream to a file (e.g. `catalog.json`) gives us something we can query with `jq` or feed into a script to compute the minimal set of bundles for an upgrade path. So: we render to get JSON because that’s the format the tool emits and the format we can use to inspect channels, versions, and upgrade edges.
+The catalog image (e.g. `redhat-operator-index:v4.18`) is an OCI image that holds **file-based catalog (FBC)** data: package definitions, channel definitions, and bundle metadata including upgrade edges. To decide *which* bundles to mirror, we need to query that metadata—e.g. “which channels contain the target bundle?”, “what is the package `defaultChannel`?”, “what is the `skipRange` of the target bundle?”, “what are the `replaces` / `skips` edges?”. The catalog image itself is not directly queryable from the command line. We therefore **dump** the FBC content to a single, machine-readable file. The standard way to do that is to **render** the catalog; the renderer outputs a **stream of JSON objects** (one JSON object per FBC entity: package, channel, bundle). Saving that stream to a file (e.g. `catalog.json`) gives us something we can query with `jq` or feed into a script to compute the minimal logical upgrade path.
 
 ### 3.2 What is `opm` and why run `opm render`?
 
@@ -544,7 +544,7 @@ opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 > catalog.json
 
 ### 3.3 Doing it manually (without the path solver script)
 
-You can compute the minimal set and write the ImageSetConfiguration by hand:
+You can compute the minimal logical path and write the ImageSetConfiguration by hand:
 
 1. **Render the catalog** (requires network access to pull the catalog image, or a copy of it):
 
@@ -564,15 +564,15 @@ You can compute the minimal set and write the ImageSetConfiguration by hand:
    jq -r 'select(.schema=="olm.channel" and .package=="PACKAGE" and .name=="CHANNEL") | .entries[] | [.name, .replaces, .skipRange] | @tsv' catalog.json
    ```
 
-4. **Decide the path** — From your current version (e.g. 2.11.4) and target version (e.g. 2.13.5), check whether the target bundle’s `skipRange` includes your current version (e.g. `>=2.11.0 <2.13.5` means you can jump directly). If not, follow the `replaces` chain and note every bundle version you must mirror.
+4. **Decide the path** — From your current version (e.g. 2.11.4) and target version (e.g. 2.13.5), check whether the target bundle’s `skipRange` includes your current version (e.g. `>=2.11.0 <2.13.5` means you can jump directly). If not, find the smallest bridge bundle that *does* connect, then repeat until you reach the installed version. Omitted intermediate minors are acceptable if the retained bundles still form a valid path through `skipRange`, `skips`, or `replaces`.
 
-5. **Write the ImageSetConfiguration** — Add a `packages` entry with the right `channels` and `minVersion` / `maxVersion` (or the specific versions) for the path you identified. Use the support matrix to choose the channel name (e.g. `release-2.13` for ACM on OCP 4.16).
+5. **Write the ImageSetConfiguration** — Add a `packages` entry with the right `channels` and `minVersion` / `maxVersion` for the path you identified. Use the support matrix to choose the supported target version first, then use the catalog metadata to determine which channel(s) contain the required bridge and target bundles. If your filtered channels do not include the upstream package default, set `packages.defaultChannel` to one of the retained channels, usually the target channel.
 
 This is error-prone for multi-channel or long chains, so the next subsection introduces a script that automates the path computation and snippet generation.
 
 ### 3.4 Using the path solver script
 
-The **path solver script** (`resolve-operator-path.sh`, in this repo next to the guide) automates the logic above: it reads the same `catalog.json`, finds the channel and bundle entries, computes the shortest valid upgrade path from your current version to the target version using `replaces` and `skipRange`, and prints an ImageSetConfiguration snippet you can paste into your config. Requirements: **Bash 4+** and **jq**.
+The **path solver script** (`resolve-operator-path.sh`, in this repo next to the guide) automates the logic above: it reads the same `catalog.json`, finds the package and channel metadata, computes the shortest valid logical upgrade path from your current version to the target version using `replaces`, `skips`, and `skipRange`, and prints an ImageSetConfiguration snippet you can paste into your config. Requirements: **Bash 4+** and **jq**.
 
 **Support matrix check (before any mirroring):**
 
@@ -583,8 +583,9 @@ The **path solver script** (`resolve-operator-path.sh`, in this repo next to the
    ```
 
 2. Open the operator product documentation and find its supportability/compatibility matrix.
-3. Match your OCP minor to the supported operator channel and target version.
-4. Record that channel/version pair and use it as the boundary for the steps below.
+3. Match your OCP minor to the newest **supported target bundle version**.
+4. Use the catalog metadata to determine which channel or channels contain that target and any required bridge bundles.
+5. Record that version/channel decision and use it as the boundary for the steps below.
 
 **Recommended workflow:**
 
@@ -605,9 +606,9 @@ The **path solver script** (`resolve-operator-path.sh`, in this repo next to the
      registry.redhat.io/redhat/redhat-operator-index:v4.18
    ```
 
-3. Use the generated ImageSetConfiguration snippet as your base. Keep `minVersion` only if you want floating heads in that channel; add `maxVersion` if you need exact pinning for change-control.
-4. Keep channel choice aligned with the support matrix for your OCP version.
-5. Mirror and publish as usual (`m2d`/`d2m` or `m2m`), then verify the target bundle is actually present in your mirrored catalog.
+3. Use the generated ImageSetConfiguration snippet as your base. Treat the printed path as the exact logical path and the emitted `minVersion`-only config as a deliberate floating-head approximation.
+4. Keep channel choice aligned with the inspected catalog metadata and your supported target version. If you must retain multiple channels, set `packages.defaultChannel` intentionally and keep `Subscription.channel` explicit during cluster-side upgrades.
+5. Mirror and publish as usual (`m2d`/`d2m` or `m2m`), then verify the required bridge and target bundles are actually present in your mirrored catalog.
 
 ## 4. Install/upgrade an existing operator with a mirrored catalog
 
@@ -616,17 +617,18 @@ This section is the practical "cluster-side" procedure after mirror publish. Ter
 **Apply generated resources in this order:**
 
 1. **ImageDigestMirrorSet (IDMS) and ImageTagMirrorSet (ITMS)** — Apply the generated `idms.yaml` and `itms.yaml` from `working-dir/cluster-resources/`.
-2. **Wait for Machine Config Pool (MCP) rollout** — Mirror redirects trigger a MachineConfig change and rolling node restart (often 30+ minutes on large clusters). Do not apply catalog resources until rollout completes.
-3. **Release image signatures (if you mirrored platform/release images)** — Apply `working-dir/cluster-resources/signature-configmap.json` (or the YAML equivalent). **Do not** apply the signature ConfigMap when you mirrored only Operators; that scenario has no release image signatures and the command would error.
-4. **Catalog metadata** — Apply the generated `CatalogSource` and/or `ClusterCatalog` manifests (or create a dedicated mirrored source as below). If **UpdateService** was generated (e.g. you set `graph: true` for platform mirroring), apply it from the same `cluster-resources` directory.
-5. **Do not modify** the fields that Red Hat lists as restricted (e.g. `spec.image` on CatalogSource, `spec.imageDigestMirrors` on IDMS). See the [official documentation — Restrictions on modifying resources](https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html-single/disconnected_environments/#restrictions-modifying-resources-generated-oc-mirror_disconnected-environments) for the full list. **You may rename** the CatalogSource (`metadata.name`): the restricted list does not include the resource name, and renaming is often required (see below).
-6. **Multiple mirror runs or multiple sparse catalogs** — If you run oc-mirror more than once (e.g. one run for ACM, another for MCE), each run produces a CatalogSource manifest. If you apply the new run’s manifest without changing the **name**, it overwrites the existing CatalogSource (same name); OperatorHub will then show only the operators from the latest run, and operators from earlier runs (still installed) will no longer appear in any catalog. **Rename** each generated CatalogSource to a unique name (e.g. `redhat-operators-acm`, `redhat-operators-mce`) so multiple catalogs coexist and already-installed operators remain visible.
+2. **Treat mirror-set changes as an operational event** — Changes to mirror-set resources can update node-level registry configuration and trigger disruptive node drains or restarts, especially when existing `IDMS` / `ITMS` objects are modified or deleted. Schedule this work inside an approved maintenance window.
+3. **Wait for Machine Config Pool (MCP) rollout when applicable** — If the mirror-set changes trigger a MachineConfig rollout, wait for it to complete before applying catalog resources. On large clusters this can take 30+ minutes.
+4. **Release image signatures (if you mirrored platform/release images)** — Apply `working-dir/cluster-resources/signature-configmap.json` (or the YAML equivalent). **Do not** apply the signature ConfigMap when you mirrored only Operators; that scenario has no release image signatures and the command would error.
+5. **Catalog metadata** — Apply the generated `CatalogSource` and/or `ClusterCatalog` manifests (or create a dedicated mirrored source as below). If **UpdateService** was generated (e.g. you set `graph: true` for platform mirroring), apply it from the same `cluster-resources` directory.
+6. **Do not modify** the fields that Red Hat lists as restricted (e.g. `spec.image` on CatalogSource, `spec.imageDigestMirrors` on IDMS). See the [official documentation — Restrictions on modifying resources](https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html-single/disconnected_environments/#restrictions-modifying-resources-generated-oc-mirror_disconnected-environments) for the full list. **You may rename** the CatalogSource (`metadata.name`): the restricted list does not include the resource name, and renaming is often required (see below).
+7. **Multiple mirror runs or multiple sparse catalogs** — If you run oc-mirror more than once (e.g. one run for ACM, another for MCE), each run produces a CatalogSource manifest. If you apply the new run’s manifest without changing the **name**, it overwrites the existing CatalogSource (same name); OperatorHub will then show only the operators from the latest run, and operators from earlier runs (still installed) will no longer appear in any catalog. **Rename** each generated CatalogSource to a unique name (e.g. `redhat-operators-acm`, `redhat-operators-mce`) so multiple catalogs coexist and already-installed operators remain visible.
 
 Then proceed with catalog publishing and subscription:
 
-7. If `clusterCatalog.yaml` is generated, use it as authoritative for that environment.
-8. If using `CatalogSource`, prefer creating a dedicated mirrored source instead of replacing the default `redhat-operators`. Retag the mirrored index image in your registry to a stable, immutable tag (e.g. by date or version) and point your mirrored `CatalogSource` at that exact tag so repeated mirror runs do not overwrite the same tag.
-9. Update the operator `Subscription` to use the mirrored CatalogSource name and supported channel.
+8. If `clusterCatalog.yaml` is generated, use it as authoritative for that environment.
+9. If using `CatalogSource`, prefer creating a dedicated mirrored source instead of replacing the default `redhat-operators`. Retag the mirrored index image in your registry to a stable, immutable tag (e.g. by date or version) and point your mirrored `CatalogSource` at that exact tag so repeated mirror runs do not overwrite the same tag.
+10. Update the operator `Subscription` to use the mirrored CatalogSource name and supported channel.
 
 ```bash
 oc -n <operator-namespace> patch subscription <subscription-name> \
@@ -639,8 +641,8 @@ oc -n <operator-namespace> patch subscription <subscription-name> \
   }}'
 ```
 
-10. If you must force an initial target, set `startingCSV` explicitly in the subscription spec.
-11. Approve the pending `InstallPlan` (if manual), then verify resulting `CSV` phase and operator deployment health.
+11. If you must force an initial target, set `startingCSV` explicitly in the subscription spec.
+12. Approve the pending `InstallPlan` (if manual), then verify resulting `CSV` phase and operator deployment health.
 
 ```bash
 oc get installplan -n <operator-namespace>
@@ -649,7 +651,7 @@ oc patch installplan <plan-name> -n <operator-namespace> \
 oc get csv -n <operator-namespace>
 ```
 
-12. Keep old mirrored catalog tags until validation is complete; then prune intentionally.
+13. Keep old mirrored catalog tags until validation is complete; then prune intentionally.
 
 ## 5. References
 
