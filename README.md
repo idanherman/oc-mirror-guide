@@ -182,73 +182,51 @@ The practical flow is:
 10. That install strategy creates the runtime resources such as `Deployment`s, service accounts, and RBAC.
 11. The Kubernetes controllers then reconcile those resources and start the operator pods using the runtime image referenced by the `CSV`. If the overall upgrade requires another hop, the **Catalog Operator** resolves the graph again from the newly installed CSV and repeats the process.
 
-The Mermaid diagram below is a visual supplement to that sequence. Component names (Catalog Operator vs OLM Operator) match OpenShift's actual controllers.
+The diagrams below break that sequence into stages. Component names (Catalog Operator vs OLM Operator) match OpenShift's actual controllers.
+
+**Stage 1: Subscription to graph resolution**
 
 ```mermaid
-flowchart TB
-  subgraph user["User"]
-    A["oc apply -f subscription.yaml"]
-  end
+flowchart LR
+  A["User creates Subscription<br/>via oc or OperatorHub"]
+  B["API server / etcd<br/>stores Subscription"]
+  C["Catalog Operator<br/>watches Subscription"]
+  D["Catalog Operator reads<br/>source/sourceNamespace"]
+  E["CatalogSource or ClusterCatalog pod<br/>serves catalog over gRPC"]
+  F["Catalog Operator resolves next hop<br/>using installed CSV + channel graph"]
 
-  subgraph api["Kubernetes API Server / etcd"]
-    B["Stores Subscription"]
-    B2["Stores OperatorGroup"]
-    F["Stores ConfigMap with bundle manifests"]
-    H["Stores InstallPlan"]
-    J["Stores CRDs and CSV"]
-    K2["Stores Deployments and RBAC"]
-  end
+  A --> B --> C --> D --> E --> F
+```
 
-  subgraph catalog_op["Catalog Operator (openshift-operator-lifecycle-manager)"]
-    C["Watches Subscriptions"]
-    D["Resolves bundle from catalog"]
-    E["Creates Bundle Unpack Job"]
-    G["Reads ConfigMap, creates InstallPlan"]
-    G2["When InstallPlan is approved, creates CRDs and CSV"]
-  end
+**Stage 2: Selected bundle to InstallPlan**
 
-  subgraph catalog_pod["CatalogSource Pod"]
-    D2["Serves catalog image via gRPC"]
-    D3["Returns bundle image ref, CSV metadata, upgrade edges"]
-  end
+```mermaid
+flowchart LR
+  A["Catalog Operator selects<br/>target or bridge bundle"]
+  B["Catalog Operator creates<br/>bundle unpack Job"]
+  C["Unpack pod pulls bundle image"]
+  D["Unpack pod extracts CSV/CRDs/metadata<br/>into a ConfigMap"]
+  E["Catalog Operator reads ConfigMap"]
+  F["Catalog Operator creates InstallPlan"]
+  G["Manual approval waits here<br/>if enabled"]
 
-  subgraph job["Job Controller + Unpack Pod"]
-    E2["Job runs unpack container"]
-    E3["Pulls bundle image, extracts manifests to ConfigMap"]
-  end
+  A --> B --> C --> D --> E --> F --> G
+```
 
-  subgraph olm_op["OLM Operator (openshift-operator-lifecycle-manager)"]
-    I["Watches CSVs"]
-    I2["Validates OperatorGroup membership and requirements"]
-    K["Runs CSV install strategy, creates Deployment and RBAC"]
-  end
+**Stage 3: InstallPlan to running operator**
 
-  subgraph runtime["Deployment Controller / Kubelet"]
-    L["ReplicaSets created"]
-    M["Operator pods run runtime image"]
-  end
+```mermaid
+flowchart LR
+  A["Approved InstallPlan"]
+  B["Catalog Operator creates<br/>CRDs and CSV"]
+  C["OLM Operator watches CSV"]
+  D["OLM Operator validates<br/>OperatorGroup and requirements"]
+  E["OLM Operator runs CSV install strategy"]
+  F["Deployment / RBAC / ServiceAccount<br/>resources are created"]
+  G["Kubernetes controllers start operator pods<br/>from the CSV runtime image"]
+  H["If another hop is needed,<br/>Catalog Operator resolves again"]
 
-  A --> B
-  B --> C
-  C --> D
-  D --> D2
-  D2 --> D3
-  D3 --> D
-  D --> E
-  E --> E2
-  E2 --> E3
-  E3 --> F
-  F --> G
-  G --> H
-  H --> G2
-  G2 --> J
-  J --> I
-  I --> I2
-  B2 --> I2
-  I2 --> K
-  K --> K2
-  K2 --> L
-  L --> M
+  A --> B --> C --> D --> E --> F --> G --> H
 ```
 
 **Notes:**
