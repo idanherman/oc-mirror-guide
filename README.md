@@ -81,13 +81,13 @@ Version notation is typically `x.y.z`:
 - `y` = minor stream
 - `z` = patch (z-stream)
 
-Publishers use channels to control release cadence and support lanes (for example conservative vs fast-moving lanes). A package can expose multiple channels, and a bundle version can appear in more than one channel. In disconnected environments this matters even more, because every additional channel or version often means additional content you must mirror, transfer, and validate.
+Publishers use channels to organize upgrade graphs and support streams. A package can expose multiple channels, and a bundle version can appear in more than one channel. In disconnected environments, channels usually matter less as release-cadence labels and more as metadata you must inspect carefully, because they complicate the decision of which bundles you actually need to mirror.
 
 #### 1.1.5 Catalog
 
 A **catalog** is metadata that tells OLM what packages/channels/bundles exist and how upgrades connect (`replaces`, `skipRange`). It does *not* contain operator runtime images.
 
-In FBC data, channel entries reference bundle names, and bundle objects include the backing bundle image reference (typically digest-resolved at mirror/install time). That is the "pointer" from package/channel metadata to actual installable content.
+In a **file-based catalog (FBC)**, which is the current JSON/YAML-based catalog format that replaced the older SQLite-backed index format, channel entries reference bundle names and bundle objects include the backing bundle image reference (typically digest-resolved at mirror/install time). That is the "pointer" from package/channel metadata to actual installable content.
 
 In OpenShift, this metadata is stored in an OCI **catalog image** (also called **index image**), commonly from families such as:
 
@@ -105,7 +105,7 @@ At a high level, FBC data is a stream of objects such as:
 - `olm.channel` (channel entries + upgrade edges)
 - `olm.bundle` (bundle metadata + bundle image reference)
 
-`opm` is the catalog utility used to inspect this content. Example:
+`opm` is the catalog tooling used to build, inspect, and serve catalog content. In this guide, we use `opm render` as the offline inspection command to dump catalog metadata into JSON so we can analyze packages, channels, bundles, and upgrade edges. Example:
 
 ```bash
 opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 > catalog.json
@@ -119,7 +119,7 @@ The cluster needs a Kubernetes resource that points OLM to a catalog image:
 - **`CatalogSource`** (`operators.coreos.com/v1alpha1`) — OLM Classic catalog source object, widely used across OCP 4.x environments.
 - **`ClusterCatalog`** (`olm.operatorframework.io/v1`) — OLM v1/extensions catalog object, documented in newer OCP flows (for example OCP 4.20 docs and oc-mirror v2 generated outputs).
 
-Without one of these pointing to your mirrored catalog image, OLM cannot resolve packages/channels for disconnected installs. After creation in the API/etcd, the catalog backend pod(s) are reconciled and started to serve catalog data to OLM.
+Without one of these pointing to your mirrored catalog image, OLM cannot resolve packages or channels for disconnected installs. After you create the resource, the relevant controllers reconcile a catalog pod, that pod pulls the mirrored catalog image, starts the catalog's gRPC-serving process, and OLM queries that service to resolve packages, channels, and bundles.
 
 #### 1.1.7 `Subscription`
 
