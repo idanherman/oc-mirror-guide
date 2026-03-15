@@ -170,15 +170,17 @@ When you create a `Subscription`, OLM does not immediately start operator pods. 
 
 The practical flow is:
 
-1. You create a `Subscription`, and the API server stores it.
-2. The **Catalog Operator** notices the `Subscription` and queries the catalog service exposed by the `CatalogSource` or `ClusterCatalog` pod.
-3. The catalog service returns the selected bundle metadata, including the bundle image reference and upgrade metadata.
-4. The **Catalog Operator** creates a bundle unpack Job. That Job pulls the bundle image and extracts its manifests into a `ConfigMap`.
-5. Using that unpacked content, the **Catalog Operator** creates an `InstallPlan`. If the subscription is `Manual`, the plan waits until you approve it.
-6. Once the `InstallPlan` is approved, the **Catalog Operator** creates install-time resources such as `CRD`s and the target `CSV`.
-7. The **OLM Operator** then reconciles the `CSV`, checks `OperatorGroup` membership and requirements, and runs the CSV install strategy.
-8. That install strategy creates the runtime resources such as `Deployment`s, service accounts, and RBAC.
-9. The Kubernetes controllers then start the operator pods using the runtime image referenced by the `CSV`.
+1. You create a `Subscription`, either with `oc apply` or through the web console in **OperatorHub**, and the API server stores it in etcd.
+2. The `Subscription` points to a specific catalog object through `spec.source` / `spec.sourceNamespace` (for `CatalogSource`) or the equivalent catalog reference in newer flows. The **Catalog Operator** watches the `Subscription`, reads that reference, and connects to that catalog service specifically rather than to "all catalogs".
+3. The catalog service is exposed by the pod that was created from the mirrored catalog image referenced by the `CatalogSource` or `ClusterCatalog`. Inside that pod, the catalog content is served over gRPC. The **Catalog Operator** queries that gRPC API for the subscribed package and channel.
+4. During that query, the **Catalog Operator** resolves the upgrade graph using the currently installed operator state on the cluster and the channel metadata in the catalog. In practice, it compares the installed CSV/version to the channel entries and their `replaces`, `skips`, and `skipRange` metadata. If the channel head is directly reachable, it can target the head immediately. If not, it selects the required bridge bundle first, and after that bridge installs successfully, the graph is resolved again for the next hop.
+5. The catalog service returns the selected bundle metadata for the next hop, including the bundle image reference, properties, dependency metadata, and install manifests metadata.
+6. The **Catalog Operator** creates a bundle unpack Job for that selected bundle image. The unpack pod pulls the bundle image, reads the bundle contents, and extracts the manifests stored inside it, typically the `ClusterServiceVersion` plus any included `CRD`s and related metadata. That unpacked content is written into a `ConfigMap`.
+7. The **Catalog Operator** reads the unpacked `ConfigMap` content and uses it to build an `InstallPlan`. If the subscription is `Manual`, the `InstallPlan` is created but waits until you approve it.
+8. Once the `InstallPlan` is approved, the **Catalog Operator** executes it and creates install-time resources such as `CRD`s and the target `CSV` for that hop.
+9. The **OLM Operator** watches the new `CSV`, checks `OperatorGroup` membership and other requirements, and then runs the CSV install strategy.
+10. That install strategy creates the runtime resources such as `Deployment`s, service accounts, and RBAC.
+11. The Kubernetes controllers then reconcile those resources and start the operator pods using the runtime image referenced by the `CSV`. If the overall upgrade requires another hop, the **Catalog Operator** resolves the graph again from the newly installed CSV and repeats the process.
 
 The Mermaid diagram below is a visual supplement to that sequence. Component names (Catalog Operator vs OLM Operator) match OpenShift's actual controllers.
 
