@@ -608,35 +608,31 @@ The **path solver script** (`resolve-operator-path.sh`, in this repo next to the
 
 This section is the practical "cluster-side" procedure after mirror publish. Terms used here are defined in **Section 1.1**.
 
-**Apply generated resources in this order:**
+**Recommended operator-focused workflow:**
 
-1. **ImageDigestMirrorSet (IDMS) and ImageTagMirrorSet (ITMS)** — Apply the generated `idms.yaml` and `itms.yaml` from `working-dir/cluster-resources/`.
-2. **Treat mirror-set changes as an operational event** — Changes to mirror-set resources can update node-level registry configuration and trigger disruptive node drains or restarts, especially when existing `IDMS` / `ITMS` objects are modified or deleted. Schedule this work inside an approved maintenance window.
-3. **Wait for Machine Config Pool (MCP) rollout when applicable** — If the mirror-set changes trigger a MachineConfig rollout, wait for it to complete before applying catalog resources. On large clusters this can take 30+ minutes.
-4. **Release image signatures (if you mirrored platform/release images)** — Apply `working-dir/cluster-resources/signature-configmap.json` (or the YAML equivalent). **Do not** apply the signature ConfigMap when you mirrored only Operators; that scenario has no release image signatures and the command would error.
-5. **Catalog metadata** — Apply the generated `CatalogSource` and/or `ClusterCatalog` manifests (or create a dedicated mirrored source as below). If **UpdateService** was generated (e.g. you set `graph: true` for platform mirroring), apply it from the same `cluster-resources` directory.
-6. **Do not modify** the fields that Red Hat lists as restricted (e.g. `spec.image` on CatalogSource, `spec.imageDigestMirrors` on IDMS). See the [official documentation — Restrictions on modifying resources](https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html-single/disconnected_environments/#restrictions-modifying-resources-generated-oc-mirror_disconnected-environments) for the full list. **You may rename** the CatalogSource (`metadata.name`): the restricted list does not include the resource name, and renaming is often required (see below).
-7. **Multiple mirror runs or multiple sparse catalogs** — If you run oc-mirror more than once (e.g. one run for ACM, another for MCE), each run produces a CatalogSource manifest. If you apply the new run’s manifest without changing the **name**, it overwrites the existing CatalogSource (same name); OperatorHub will then show only the operators from the latest run, and operators from earlier runs (still installed) will no longer appear in any catalog. **Rename** each generated CatalogSource to a unique name (e.g. `redhat-operators-acm`, `redhat-operators-mce`) so multiple catalogs coexist and already-installed operators remain visible.
+1. **Publish the mirrored registry configuration on the cluster** — Apply the generated `ImageDigestMirrorSet` and `ImageTagMirrorSet` resources from `working-dir/cluster-resources/`. Treat this as one operational task: mirror-set changes can update node-level registry configuration and may trigger disruptive node drains or a MachineConfig rollout, especially when existing `IDMS` / `ITMS` objects are modified or deleted. Schedule this work inside a maintenance window and wait for any required MCP rollout to finish before continuing.
 
-Then proceed with catalog publishing and subscription:
+2. **Publish a dedicated mirrored catalog and retag its image intentionally** — For OLM operators in disconnected environments, do **not** rely only on renaming the `CatalogSource` resource. If you push a later oc-mirror run to the same catalog image tag in your registry, the new catalog image replaces the previous one even if the Kubernetes resource name is different. The safe pattern is:
+   - give each mirrored catalog image a new, stable tag in your registry (for example by date, run number, or operator scope)
+   - create or update a dedicated `CatalogSource` or `ClusterCatalog` that points `spec.image` at that exact retagged image
+   - give the API resource a unique name as well, so applying a later run does not replace the older catalog resource unintentionally
 
-8. If `clusterCatalog.yaml` is generated, use it as authoritative for that environment.
-9. If using `CatalogSource`, prefer creating a dedicated mirrored source instead of replacing the default `redhat-operators`. Retag the mirrored index image in your registry to a stable, immutable tag (e.g. by date or version) and point your mirrored `CatalogSource` at that exact tag so repeated mirror runs do not overwrite the same tag.
-10. Update the operator `Subscription` to use the mirrored CatalogSource name and supported channel.
+3. **Use the new catalog explicitly in the operator `Subscription`** — If the operator is currently subscribed to an older mirrored catalog, patch the `Subscription` so it points to the new `CatalogSource` first. Then set the supported target channel and keep `installPlanApproval: Manual`. If the `Subscription` still points to the previous catalog, OLM will continue resolving from that older catalog and the new bundles will not be used.
 
 ```bash
 oc -n <operator-namespace> patch subscription <subscription-name> \
   --type merge \
   --patch '{"spec":{
-    "source":"redhat-operators-mirrored",
+    "source":"redhat-operators-mirrored-2026-03-15",
     "sourceNamespace":"openshift-marketplace",
     "channel":"<supported-channel>",
     "installPlanApproval":"Manual"
   }}'
 ```
 
-11. If you must force an initial target, set `startingCSV` explicitly in the subscription spec.
-12. Approve the pending `InstallPlan` (if manual), then verify resulting `CSV` phase and operator deployment health.
+4. **If needed, force the initial target** — If you must force the first selected bundle for a controlled starting point, set `startingCSV` explicitly in the `Subscription` spec.
+
+5. **Approve the pending `InstallPlan` and validate the result** — Once the `Subscription` points to the correct catalog and channel, approve the `InstallPlan` if you are using manual approval, then verify the resulting `CSV` phase and operator deployment health.
 
 ```bash
 oc get installplan -n <operator-namespace>
@@ -645,7 +641,9 @@ oc patch installplan <plan-name> -n <operator-namespace> \
 oc get csv -n <operator-namespace>
 ```
 
-13. Keep old mirrored catalog tags until validation is complete; then prune intentionally.
+6. **Keep old catalog images and catalog resources until validation is complete** — Do not delete or overwrite the previous mirrored catalog immediately. Keep the older tagged catalog image and older `CatalogSource` until the new upgrade is validated, then prune intentionally.
+
+**Side note for platform mirroring:** If you mirrored OpenShift release payloads in the same run, also apply the generated release signature ConfigMap from `working-dir/cluster-resources/`. This is not needed for an operators-only mirror run.
 
 ## 5. References
 
