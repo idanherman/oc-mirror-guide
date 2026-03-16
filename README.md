@@ -509,44 +509,7 @@ Detailed cluster-side apply order, catalog retagging, and `Subscription` switch 
 6. Apply cluster resources in order (see Section 4): IDMS and ITMS, wait for Machine Config Pool (MCP) rollout, then apply signature ConfigMap (if you mirrored release images), then catalog and UpdateService manifests.
 7. Update the `Subscription` (channel, source, `installPlanApproval`, `startingCSV` if desired) and approve the `InstallPlan`.
 
-### 2.12 Troubleshooting
-
-| Symptom                                               | Likely cause                                               | Fix                                                                                            |
-| ----------------------------------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| oc-mirror fails mid-run on a slow link                | Retry/timeout too low                                      | Increase `--retry-times` and `--image-timeout` (e.g. `1h`)                                     |
-| d2m cannot find content                               | Wrong `--from` or tarballs missing/corrupt                 | Ensure directory has `mirror_seq*.tar` and matches `--from`                                    |
-| OperatorHub empty after push                          | Catalog manifest not applied or catalog pod failing        | Apply generated `catalogsource.yaml`/`clusterCatalog.yaml`; check catalog pod logs             |
-| Catalog pod ImagePullBackOff (disconnected)           | Mirror redirects not applied first or MCP not updated      | Apply idms/itms YAMLs, wait for MCP rollout, then re-apply catalog                             |
-| Operator tile present but install fails on image pull | Full index but not all packages mirrored                   | Use a separate `CatalogSource` for the mirrored subset (retag and new `CatalogSource`)         |
-| OLM does not offer expected upgrade                   | Wrong channel, unsupported channel, or target not mirrored | Align `Subscription` channel with support matrix; confirm target bundle is in mirrored catalog |
-| Ran `oc-mirror delete` but registry size unchanged   | Only manifests were removed; blobs remain until GC runs    | Run your registry's garbage collector to reclaim storage; see official docs for your registry   |
-
-### 2.13 Quick reference (flags)
-
-| Flag                  | Purpose                                   | When to use                            |
-| --------------------- | ----------------------------------------- | -------------------------------------- |
-| `--v2`                | Use v2 behavior                           | Always                                 |
-| `--retry-times N`     | Retry failed pulls N times                | Production; set at least 3–5           |
-| `--image-timeout D`   | Per-image timeout (`10m`, `1h`)           | Slow links or large images             |
-| `--authfile`          | Auth file path                            | Non-default credential location        |
-| `--from`              | Source directory for d2m                  | Air-gap: directory containing tarballs |
-| `--workspace`         | Metadata workspace for m2m               | Bastion m2m runs                       |
-| `--since`             | Only content newer than date              | Incremental runs                       |
-| `--cache-dir`         | Override cache location                   | Custom layout or shared systems        |
-| `--dry-run`           | Print actions without mirroring           | Validate config and destination        |
-| `--parallel-images N` | Images mirrored in parallel (default 8)  | Tuning for fast links or throttled registries |
-| `--parallel-layers N` | Layers per image in parallel (default 10) | Tuning for large images                |
-| `--strict-archive`    | Fail if an archive exceeds configured size | When using `archiveSize` in ImageSetConfiguration |
-
-### 2.14 Caveats
-
-- **skipDependencies** in ImageSetConfiguration is not a safe substitute for testing; validate in pre-production if you rely on dependency trimming.
-- **Catalog default channel** often targets a newer OCP than yours. Always set the `Subscription` channel from the product support matrix.
-- **Mirror redirect (IDMS/ITMS) rollout** triggers a Machine Config Pool (MCP) change and rolling node restart (30+ minutes on large clusters). Apply catalog only after MCP rollout completes.
-- **v1 is deprecated.** Use `opm render` (and path solver) for real workflows; reserve `oc mirror list operators --v1` for quick exploration only.
-- **Enclave / multi-registry:** For mirroring to multiple enclaves or custom registry configuration (e.g. signature storage), see [Enclave support](https://github.com/openshift/oc-mirror/blob/main/v2/docs/features/enclave_support.md) and the `--registries.d` flag in the oc-mirror README.
-
-### 2.15 Delete subcommand and catalog pinning
+### 2.12 Delete subcommand and catalog pinning
 
 **Deleting images from the mirror registry:** oc-mirror v2 does not auto-prune. To remove images you no longer need, use the `oc-mirror delete` subcommand in two phases: (1) with a `DeleteImageSetConfiguration` and `--generate`, oc-mirror produces a delete-images YAML; (2) run `oc-mirror delete --delete-yaml-file <path>` to remove manifests from the registry. Only manifests are deleted; run your registry's **garbage collector** to reclaim blob storage. See the [Disconnected environments documentation](https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html-single/disconnected_environments/#delete-mirror-registry-content) for the full procedure.
 
