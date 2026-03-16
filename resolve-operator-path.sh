@@ -55,11 +55,12 @@ TMP_GRAPH=$(mktemp)
 trap 'rm -f "$TMP_GRAPH"' EXIT
 
 jq -r --arg pkg "$OPERATOR" '
+  (if type == "array" then .[] else . end) |
   select(.schema == "olm.channel" and .package == $pkg) |
   .name as $chan |
   .entries[] |
   [.name, $chan, (.replaces // ""), ((.skips // []) | join(",")), (.skipRange // "")] |
-  @tsv
+  join("\u001f")
 ' "$CATALOG_FILE" > "$TMP_GRAPH"
 
 if [[ ! -s "$TMP_GRAPH" ]]; then
@@ -81,7 +82,7 @@ short_ver_from_bundle() {
   printf '%s\n' "${bundle_name##*.v}"
 }
 
-while IFS=$'\t' read -r name channel replaces skips skipRange; do
+while IFS=$'\x1f' read -r name channel replaces skips skipRange; do
   [[ -z "$name" ]] && continue
 
   SHORT_VER=$(short_ver_from_bundle "$name")
