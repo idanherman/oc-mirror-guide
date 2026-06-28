@@ -1,6 +1,6 @@
 # OpenShift OLM Field Guide for Disconnected Environments
 
-**Last updated:** 2025-03-11 · **Document version:** 1.1
+**Last updated:** 2026-06-28 · **Document version:** 1.2
 
 This guide is for Red Hat consultants and customer platform teams who need to mirror and upgrade OLM-based operators in disconnected or air-gapped OpenShift environments. It focuses on the part that usually causes real project delays: decision quality. In air-gap programs, every mirror run has cost (time, bandwidth, media handling, security review, and change windows), so the goal is not to mirror everything. The goal is to mirror exactly what your cluster needs, on a supported path, with predictable operational outcomes.
 
@@ -350,38 +350,30 @@ oc-mirror v1 was deprecated in OCP 4.18 and will be removed in a future release.
 - Pass `--v2` on the command line.
 - Use `apiVersion: mirror.openshift.io/v2alpha1` in your ImageSetConfiguration.
 
-The only v1-only feature still useful for exploration is `oc mirror list operators` (catalogs, packages, channels); it was not ported to v2. Prefer v2 for any real mirror run.
-
 Quick exploration examples:
 
 ```bash
 # List available packages in a catalog
-oc mirror list operators \
-  --catalog=registry.redhat.io/redhat/redhat-operator-index:v4.18 \
-  --v1
+oc-mirror --v2 list operators \
+  --catalog=registry.redhat.io/redhat/redhat-operator-index:v4.18
 
 # List channels for a package
-oc mirror list operators \
+oc-mirror --v2 list operators \
   --catalog=registry.redhat.io/redhat/redhat-operator-index:v4.18 \
-  --package=advanced-cluster-management \
-  --v1
+  --package=advanced-cluster-management
 
 # List versions in a specific channel
-oc mirror list operators \
+oc-mirror --v2 list operators \
   --catalog=registry.redhat.io/redhat/redhat-operator-index:v4.18 \
   --package=advanced-cluster-management \
-  --channel=release-2.13 \
-  --v1
+  --channel=release-2.13
 ```
 
 #### 2.3.4 Authentication
 
 oc-mirror must authenticate to `registry.redhat.io` (and optionally other registries). It does **not** require Podman or Docker at runtime; it is a self-contained binary that uses the `containers/image` library. It does require a valid **auth file** in a format that library understands.
 
-**Default auth file locations** (see upstream v2 README; your binary may differ, confirm with `--help`):
-
-- `$XDG_RUNTIME_DIR/containers/auth.json`
-- `~/.docker/config.json`
+**Default auth file location:** `${XDG_RUNTIME_DIR}/containers/auth.json` (documented default for `--authfile`). The underlying `containers/image` library also falls back to `~/.docker/config.json` if the primary location is absent, but this is a library-level fallback, not a documented oc-mirror default.
 
 If your system uses another path (e.g. `~/.config/containers/auth.json` on some Podman setups), pass `--authfile` explicitly so oc-mirror finds the file.
 
@@ -465,6 +457,8 @@ mirror:
 
 **minVersion / maxVersion:** In current v2 behavior, omitting `maxVersion` keeps the lower bound while allowing newer z-stream content in later runs. Omitting both typically mirrors channel head behavior for the selected scope. Validate on your exact binary with `oc-mirror --v2 --help`. If you set version bounds but do not name a channel, oc-mirror can use the package **default channel**, which is sometimes not the one supported for your OCP version - always name the channel explicitly. If your filtered channel set excludes the upstream package default, use the package `defaultChannel` field in the ImageSetConfiguration so the filtered catalog remains internally consistent.
 
+**Default channel requirement:** The official documentation states that you must always include the default channel for the Operator package in your channel list, even if you do not use the bundles in that channel. If you exclude it, set the `packages.defaultChannel` field to one of the retained channels so oc-mirror can build an internally consistent filtered catalog. When in doubt, use `--dry-run` to validate your ImageSetConfiguration before committing to a full mirror run.
+
 **additionalImages** - For non-operator OCI images (e.g. app base images) that must be available in the disconnected environment. Plain image copies; no OLM semantics. **You must use explicit registry hostnames** for every image listed under `additionalImages` (e.g. `quay.io/org/image:tag` or `registry.redhat.io/ubi8/ubi:latest`). Otherwise oc-mirror v2 can mirror them to incorrect target paths.
 
 ### 2.8 Advanced version-selection workflow
@@ -533,14 +527,26 @@ opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 > catalog.json
 
 `opm` pulls the catalog image, reads the FBC content inside it, and **renders** it as a stream of JSON objects. Each object has a `schema` field (e.g. `olm.package`, `olm.channel`, `olm.bundle`) and the fields that define that entity. Channel objects include `entries` with bundle names and their `replaces` / `skipRange`; bundle objects include the bundle image reference. We run `opm render` so we have a single file that describes the entire catalog and its upgrade graph, which we can then query to decide the minimal mirror set.
 
+**Pruned render (recommended):** A raw `opm render` dump includes `olm.bundle` objects with base64-encoded manifests (`olm.bundle.object` properties) that account for over 90% of the file size (e.g. ~1.1 GB for `redhat-operator-index:v4.16`). The path solver and the manual `jq` queries in this guide only need `olm.package` and `olm.channel` objects. Pipe through `jq` to strip the rest:
+
+```bash
+opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 \
+  | jq -c 'if .schema == "olm.package" or .schema == "olm.channel" then . else empty end' \
+  > catalog.json
+```
+
+This produces a file of ~830 KB instead of ~1.1 GB, and the path solver runs in under 2 seconds instead of 30.
+
 ### 3.3 Doing it manually (without the path solver script)
 
 You can compute the minimal logical path and write the ImageSetConfiguration by hand:
 
-1. **Render the catalog** (requires network access to pull the catalog image, or a copy of it):
+1. **Render the catalog** (requires network access to pull the catalog image, or a copy of it). Use the pruned pipeline from Section 3.2 for faster queries:
 
    ```bash
-   opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 > catalog.json
+   opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 \
+     | jq -c 'if .schema == "olm.package" or .schema == "olm.channel" then . else empty end' \
+     > catalog.json
    ```
 
 2. **List channels for your package** (replace `PACKAGE` with e.g. `advanced-cluster-management`):
@@ -580,10 +586,12 @@ The **path solver script** (`resolve-operator-path.sh`, in this repo next to the
 
 **Recommended workflow:**
 
-1. Render the catalog (if you have not already):
+1. Render the catalog (if you have not already). Use the pruned pipeline from Section 3.2:
 
    ```bash
-   opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 > catalog.json
+   opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 \
+     | jq -c 'if .schema == "olm.package" or .schema == "olm.channel" then . else empty end' \
+     > catalog.json
    ```
 
 2. Run the path solver with package name, current version, target version, path to `catalog.json`, and (optionally) catalog image:

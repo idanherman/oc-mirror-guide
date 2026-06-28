@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ==============================================================================
-# SCRIPT: resolve-operator-path.sh (v7)
+# SCRIPT: resolve-operator-path.sh (v8)
 # PURPOSE:  Consultant-grade OLM Path Solver.
 # FEATURES: 
 #   1. Floating Heads (minVersion only) for maximum graph stability.
@@ -10,9 +10,9 @@ set -euo pipefail
 #   3. Shortest Path (BFS) to minimize total hops.
 # ==============================================================================
 
-if (( BASH_VERSINFO[0] < 4 )); then
-  echo "❌ Error: This script requires Bash 4+ (associative arrays)."
-  echo "On macOS, install a newer Bash or run it on a Linux host."
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+  echo "❌ Error: This script requires Bash 4.4+ (associative arrays and safe array slicing)."
+  echo "On macOS, install a newer Bash via Homebrew or run it on a Linux host (RHEL 8+)."
   exit 1
 fi
 
@@ -47,6 +47,14 @@ if [[ "$CURRENT_VER" == "$TARGET_VER" ]]; then
   exit 0
 fi
 
+DOWNGRADE_CHECK=$(echo -e "$CURRENT_VER\n$TARGET_VER" | sort -V | head -n1)
+if [[ "$DOWNGRADE_CHECK" == "$TARGET_VER" && "$CURRENT_VER" != "$TARGET_VER" ]]; then
+  echo "❌ Error: TARGET_VER ($TARGET_VER) is older than CURRENT_VER ($CURRENT_VER)."
+  echo "OLM does not support downgrades. Check if you swapped the arguments."
+  echo "Usage: $0 <OPERATOR> <CURRENT_VER> <TARGET_VER> <CATALOG_FILE> [CATALOG_IMAGE]"
+  exit 1
+fi
+
 # ==============================================================================
 # 1. EXTRACT DATA (Channel-Aware)
 # ==============================================================================
@@ -79,7 +87,11 @@ TARGET_MATCHES=0
 
 short_ver_from_bundle() {
   local bundle_name=$1
-  printf '%s\n' "${bundle_name##*.v}"
+  local ver="${bundle_name#"$OPERATOR".v}"
+  if [[ "$ver" == "$bundle_name" ]]; then
+    ver="${bundle_name#"$OPERATOR".}"
+  fi
+  printf '%s\n' "$ver"
 }
 
 while IFS=$'\x1f' read -r name channel replaces skips skipRange; do
@@ -128,8 +140,8 @@ check_range() {
   if [[ "$range_str" == "None" || -z "$range_str" ]]; then return 1; fi
   
   for cond in $range_str; do
-    local op=$(echo "$cond" | sed -E 's/([<>=]+).*/\1/')
-    local limit=$(echo "$cond" | sed -E 's/[<>=]+(.*)/\1/')
+    local op="${cond%%[0-9.]*}"
+    local limit="${cond#"$op"}"
     case "$op" in
       ">=") if ! ver_gte "$ver" "$limit"; then return 1; fi ;;
       "<=") if ! ver_gte "$limit" "$ver"; then return 1; fi ;;
@@ -262,14 +274,24 @@ echo "    - catalog: $CATALOG_IMAGE"
 echo "      packages:"
 echo "        - name: $OPERATOR"
 
-OUTPUT_CHANNELS=()
+declare -A CHANNEL_MIN_VERSION
+declare -A CHANNEL_ORDER
+CHANNEL_COUNT=0
 for (( i=${#FINAL_PATH[@]}-1; i>=0; i-- )); do
   ENTRY_ID=${FINAL_PATH[$i]}
+  v=${NODE_VERSION[$ENTRY_ID]}
   REAL_CHANNEL=${NODE_CHANNEL[$ENTRY_ID]}
 
-  if [[ "${#OUTPUT_CHANNELS[@]}" -eq 0 || "${OUTPUT_CHANNELS[${#OUTPUT_CHANNELS[@]}-1]}" != "$REAL_CHANNEL" ]]; then
-    OUTPUT_CHANNELS+=("$REAL_CHANNEL")
+  if [[ -z "${CHANNEL_MIN_VERSION[$REAL_CHANNEL]:-}" ]]; then
+    CHANNEL_MIN_VERSION[$REAL_CHANNEL]=$v
+    CHANNEL_ORDER[$CHANNEL_COUNT]=$REAL_CHANNEL
+    CHANNEL_COUNT=$((CHANNEL_COUNT + 1))
   fi
+done
+
+OUTPUT_CHANNELS=()
+for (( i=0; i<CHANNEL_COUNT; i++ )); do
+  OUTPUT_CHANNELS+=("${CHANNEL_ORDER[$i]}")
 done
 
 FILTERED_DEFAULT_CHANNEL=""
@@ -296,19 +318,8 @@ fi
 
 echo "          channels:"
 
-LAST_CHANNEL=""
-for (( i=${#FINAL_PATH[@]}-1; i>=0; i-- )); do
-  ENTRY_ID=${FINAL_PATH[$i]}
-  v=${NODE_VERSION[$ENTRY_ID]}
-  REAL_CHANNEL=${NODE_CHANNEL[$ENTRY_ID]}
-
-  if [[ "$REAL_CHANNEL" == "$LAST_CHANNEL" ]]; then
-    continue
-  fi
-
+for REAL_CHANNEL in "${OUTPUT_CHANNELS[@]}"; do
   echo "            - name: $REAL_CHANNEL"
-  echo "              minVersion: $v"
-  # maxVersion omitted deliberately to allow floating head (z-stream updates)
-  LAST_CHANNEL=$REAL_CHANNEL
+  echo "              minVersion: ${CHANNEL_MIN_VERSION[$REAL_CHANNEL]}"
 done
 echo "----------------------------------------------------"
