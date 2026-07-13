@@ -17,14 +17,6 @@ The official OpenShift and `oc-mirror` documentation already defines supported c
 - not a generic Kubernetes operator tutorial
 - not a promise that one workflow fits every security boundary or customer process
 
-**How to use this guide:**
-
-- read **Section 1** once to lock the mental model
-- use **Section 2** for `oc-mirror` setup and baseline workflows
-- use **Section 3** for minimal-version mirroring (`skipRange` + path solver)
-- use **Section 4** for cluster-side install/upgrade actions
-- treat examples as templates and always validate channel/version decisions against your product support matrix
-
 **Table of contents**
 
 - [1. Foundations](#1-foundations) - Terminology, OLM flow, mental model, compatibility matrix
@@ -48,9 +40,7 @@ Terms are ordered to make the flow easier to follow: each concept is introduced 
 An **operator** is application-specific automation for Kubernetes (and OpenShift). In practice it is one or more controllers plus API extensions that provide additional functionality to the cluster.
 
 - **Cluster Operators** - Shipped as part of the OpenShift release payload and managed by the **Cluster Version Operator (CVO)**. During cluster installation and cluster upgrades, CVO deploys them as part of the platform lifecycle. You do not install these through OLM.
-- **Optional add-on operators** - Managed by **Operator Lifecycle Manager (OLM)**. Unlike Cluster Operators, these are selected per environment and installed from catalogs based on your package/channel/subscription choices.
-
-This guide primarily targets OLM-based operators, but it also covers the disconnected mirroring workflow around them (`oc-mirror`, catalog publishing, and subscription changes).
+- **Optional add-on operators** - Managed by **Operator Lifecycle Manager (OLM)** (detailed in Section 1.1.10). Unlike Cluster Operators, these are selected per environment and installed from catalogs based on your package/channel/subscription choices. This guide primarily targets these OLM-based operators.
 
 #### 1.1.2 Package
 
@@ -58,9 +48,10 @@ A **package** is the top-level product name used to identify an operator offerin
 
 #### 1.1.3 Bundle (bundle image)
 
-In this guide, **bundle** means **bundle image** unless explicitly stated otherwise.
+> [!NOTE]
+> In this guide, **bundle** means **bundle image** unless explicitly stated otherwise.
 
-A bundle image is one installable operator version, shipped as a non-runnable OCI image that carries manifests and metadata. OLM pulls it to read manifests; it does not run the bundle image as a workload.
+A bundle image is one installable operator version, shipped as a non-runnable OCI image that carries manifests and metadata. During installation, OLM creates an unpack Job that **pulls the bundle image from the container registry**, extracts manifests from it, and writes them into a `ConfigMap`. OLM does not run the bundle image as a workload — it only reads the manifests from it. Although the catalog also contains a base64-encoded copy of these manifests (as `olm.bundle.object` properties), OLM does not use that copy for installation — the bundle image is always pulled from the registry (see Stage 2 in Section 1.2 for details).
 
 **Directory layout.** A bundle image has two main directories:
 
@@ -69,7 +60,7 @@ A bundle image is one installable operator version, shipped as a non-runnable OC
   - **One or more `CRD` manifests** required by that version.
 - **`metadata/`** - Catalog annotations used by tooling. In many bundles this is primarily `annotations.yaml`; some build pipelines add related metadata files.
 
-The bundle unpack job extracts bundle manifests into a `ConfigMap`. Later OLM controllers use that unpacked content during `InstallPlan` execution and `CSV` reconciliation (explained in sections 1.1.10 and 1.2).
+The bundle unpack Job extracts these manifests into a `ConfigMap`. OLM controllers then use that unpacked content during `InstallPlan` execution and `CSV` reconciliation (explained in Section 1.2).
 
 #### 1.1.4 Channel
 
@@ -81,11 +72,11 @@ Version notation is typically `x.y.z`:
 - `y` = minor stream
 - `z` = patch (z-stream)
 
-Publishers use channels to organize upgrade graphs and support streams. A package can expose multiple channels, and a bundle version can appear in more than one channel. In disconnected environments, channels usually matter less as release-cadence labels and more as metadata you must inspect carefully, because they complicate the decision of which bundles you actually need to mirror.
+Publishers use channels to organize upgrade graphs and support streams. A package can expose multiple channels, and a bundle version can appear in more than one channel. In disconnected environments, channels usually matter less as release-cadence labels and more as metadata you must inspect carefully, because they complicate the decision of which bundles you actually need to mirror. 
 
 #### 1.1.5 Catalog
 
-A **catalog** is metadata that tells OLM what packages/channels/bundles exist and how upgrades connect (`replaces`, `skipRange`). It does *not* contain operator runtime images.
+A **catalog** is metadata that tells OLM what packages/channels/bundles exist and how upgrades connect (`replaces`, `skipRange`). It contains upgrade-graph metadata and base64-encoded copies of bundle manifests (CSV, CRDs), but it does **not** contain the operator's runtime container images or the bundle images themselves — those are separate OCI images pulled from the registry at install time.
 
 In a **file-based catalog (FBC)**, which is the current JSON/YAML-based catalog format that replaced the older SQLite-backed index format, channel entries reference bundle names and bundle objects include the backing bundle image reference (typically digest-resolved at mirror/install time). That is the "pointer" from package/channel metadata to actual installable content.
 
@@ -97,14 +88,14 @@ In OpenShift, this metadata is stored in an OCI **catalog image** (also called *
 
 Some older releases and environments may also include **Red Hat Marketplace** (`redhat-marketplace`).
 
-Catalog images are versioned by OCP minor (for example `redhat-operator-index:v4.18`) and are not interchangeable across OCP minors. Modern index images carry **file-based catalog (FBC)** content, which you can inspect with `opm render`.
+Catalog images are versioned by OCP minor (for example `redhat-operator-index:v4.18`) and are not interchangeable across OCP minors. Modern index images carry **file-based catalog (FBC)** content. The FBC tooling is provided by **`opm`** (Operator Package Manager), which can render, validate, and serve catalog data. In this guide we primarily use `opm render` to dump catalog content to JSON for offline analysis.
 
-At a high level, FBC data is a stream of objects such as:
+FBC data is a **stream of JSON objects** (one object per entity, concatenated or newline-delimited). Each object has a `schema` field that identifies its type:
 
-- `olm.package` (package definitions, including a `defaultChannel` field)
-- `olm.channel` (channel entries + upgrade edges via `replaces`, `skips`, `skipRange`)
-- `olm.bundle` (bundle metadata, `relatedImages`, and bundle image reference)
-- `olm.deprecations` (optional deprecation notices for packages, channels, or specific bundles)
+- `olm.package` — package definition, including a `defaultChannel` field that determines which channel OLM uses when none is specified
+- `olm.channel` — channel definition with an `entries` array; each entry has a bundle name and upgrade edges (`replaces`, `skips`, `skipRange`)
+- `olm.bundle` — bundle metadata including the bundle `image` reference, `relatedImages` (operand container images), and `properties` (which include base64-encoded manifests as `olm.bundle.object`)
+- `olm.deprecations` — optional deprecation notices targeting specific packages, channels, or bundles
 
 **Catalog image on-disk layout.** Inside the catalog image, FBC data lives under `/configs/`. The primary file is `/configs/index.json` (or multiple files in that directory). When the catalog pod starts, `opm serve /configs` reads these files, optionally uses a prebuilt cache at `/tmp/cache/`, and exposes the content over a gRPC service that OLM queries. This on-disk layout is important to understand because it is the same structure you replicate when building a pruned catalog image manually (see Section 2.13).
 
@@ -117,9 +108,9 @@ At a high level, FBC data is a stream of objects such as:
     └── cache/           # opm serve cache (pogreb format)
 ```
 
-**The `defaultChannel` field** in `olm.package` entries tells OLM which channel to resolve when a `Subscription` does not specify one explicitly. Every `olm.package` must have a `defaultChannel` that points to a channel present in the catalog; otherwise `opm validate` fails and OLM cannot serve the catalog.
+Every `olm.package` must have a `defaultChannel` that points to a channel present in the catalog; otherwise `opm validate` fails and OLM cannot serve the catalog. This becomes important when building pruned catalogs (Section 2.13) or filtering with oc-mirror (Section 2.7).
 
-`opm` is the catalog tooling used to build, inspect, and serve catalog content. In this guide, we use `opm render` as the offline inspection command to dump catalog metadata into JSON so we can analyze packages, channels, bundles, and upgrade edges. Example:
+Example of rendering and querying a catalog:
 
 ```bash
 opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 > catalog.json
@@ -128,12 +119,12 @@ jq -r 'select(.schema=="olm.channel") | .package, .name' catalog.json
 
 #### 1.1.6 `CatalogSource` / `ClusterCatalog`
 
-The cluster needs a Kubernetes resource that points OLM to a catalog image:
+The cluster needs a Kubernetes resource that points OLM to a catalog image. There are two mechanisms, depending on OCP version:
 
-- **`CatalogSource`** (`operators.coreos.com/v1alpha1`) - OLM Classic catalog source object, widely used across OCP 4.x environments.
-- **`ClusterCatalog`** (`olm.operatorframework.io/v1`) - OLM v1/extensions catalog object, documented in newer OCP flows (for example OCP 4.20 docs and oc-mirror v2 generated outputs).
+- **`CatalogSource`** (`operators.coreos.com/v1alpha1`) — Used in OCP 4.x with OLM Classic. When you create a `CatalogSource`, the Catalog Operator creates a **dedicated pod** that pulls the catalog image, runs `opm serve` inside it, and exposes the FBC content over a gRPC service. OLM then queries that pod's gRPC endpoint to resolve packages and bundles.
+- **`ClusterCatalog`** (`olm.operatorframework.io/v1`) — Used in newer OCP flows (OCP 4.17+ with OLM v1 / catalogd). Instead of creating a per-catalog pod, the **catalogd** controller pulls the catalog image, extracts the FBC content (`/configs/`), and serves it through its own HTTP API. There is no separate `opm serve` pod per catalog.
 
-Without one of these pointing to your mirrored catalog image, OLM cannot resolve packages or channels for disconnected installs. After you create the resource, the relevant controllers reconcile a catalog pod, that pod pulls the mirrored catalog image, starts the catalog's gRPC-serving process, and OLM queries that service to resolve packages, channels, and bundles.
+Without one of these pointing to your mirrored catalog image, OLM cannot resolve packages or channels for disconnected installs.
 
 #### 1.1.7 `Subscription`
 
@@ -161,11 +152,18 @@ An **`InstallPlan`** is a Catalog Operator resource listing what should be insta
 
 #### 1.1.9 `OperatorGroup`
 
-An **`OperatorGroup`** defines operator scope (target namespaces) for a namespace.
+An **`OperatorGroup`** tells OLM **which namespaces an operator is allowed to watch and manage**. Without an `OperatorGroup` in the operator's install namespace, OLM refuses to run the CSV's install strategy.
 
-- A `CSV` must be an active member of an `OperatorGroup` before install strategy runs.
-- It controls where RBAC is projected and how operator watch scope is derived.
-- In practice, keep ownership clear and avoid overlapping/conflicting groups in the same namespace.
+**Why it exists:** A single cluster can have many operators installed in different namespaces. The `OperatorGroup` prevents scope conflicts — it defines the "tenant boundary" so two operators don't accidentally manage the same namespace or create conflicting RBAC.
+
+**Three modes:**
+
+- **AllNamespaces** — The operator watches all namespaces. Used for cluster-wide operators like ACM, GitOps, or compliance operators. The `OperatorGroup` has an empty `spec.targetNamespaces` list (or the field is omitted entirely).
+- **SingleNamespace** — The operator watches only its own namespace. Used for namespace-scoped operators. The `spec.targetNamespaces` list contains exactly one namespace.
+- **MultiNamespace** — The operator watches a specific set of namespaces. The `spec.targetNamespaces` list contains multiple entries.
+
+**In practice:** Most Red Hat operators use AllNamespaces mode. When you install an operator through OperatorHub, OCP creates the `OperatorGroup` automatically in the install namespace. In disconnected environments where you create the `Subscription` manually, verify an `OperatorGroup` exists in the target namespace — if it is missing, OLM will not proceed past the `InstallPlan` phase.
+
 
 #### 1.1.10 Operator Lifecycle Manager (OLM)
 
@@ -323,7 +321,7 @@ This page lists each operator's supported versions, the OCP versions they run on
 1. Look up your operator in the matrix. Find the row for your currently installed version and confirm it supports your current OCP version.
 2. Find the latest version that supports your current OCP version (this is your phase-1 target if you need to upgrade the operator before upgrading OCP).
 3. Find the version that supports your target OCP version (this is your phase-2 target).
-4. Verify there is a version that spans both your current and target OCP versions, so you can bridge the OCP upgrade without the operator running unsupported. If no single version spans both, you need an intermediate OCP hop where you upgrade the operator.
+4. Verify there is a version that spans both your current and target OCP versions, so you can bridge the OCP upgrade without the operator running unsupported. If no single version spans both, you need an intermediate OCP hop where you upgrade the operator. In some cases, teams accept the risk of temporarily running an operator on an unsupported OCP version (e.g. the operator still functions but Red Hat cannot provide support for that combination). If you are considering this, consult with Red Hat support beforehand and document the risk window in your change plan.
 
 **Example:** If ACM 2.13 supports OCP 4.16-4.19 and ACM 2.15 supports OCP 4.18-4.21, then on OCP 4.18 you can upgrade ACM from 2.13 to 2.15, and then safely upgrade OCP to 4.20 while ACM 2.15 still supports it.
 
@@ -339,7 +337,9 @@ oc-mirror is the supported Red Hat tool for copying OpenShift and operator conte
 
 ### 2.1 What oc-mirror does
 
-oc-mirror uses a single declarative **ImageSetConfiguration** file to decide what to copy. It can mirror:
+oc-mirror uses a single declarative **ImageSetConfiguration** file to decide what to copy. Internally, oc-mirror runs an **embedded container registry** on `localhost:55000` (configurable with `--port`) that acts as a local cache. During m2d, pulled images are stored in this cache before being archived. During d2m, the tarball is extracted into this cache, and images are pushed from it to the destination registry. This cache registry is transient — it runs only while oc-mirror is active and is not exposed outside the host.
+
+oc-mirror can mirror:
 
 - **Platform (OCP) release images and update graph** - For installing or upgrading the cluster itself in a disconnected way.
 - **Operator catalogs** - Catalog images (index images) and the bundle images they reference, so OLM on the disconnected cluster can install and upgrade operators.
