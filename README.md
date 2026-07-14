@@ -1,28 +1,32 @@
 # OpenShift OLM Field Guide for Disconnected Environments
 
-**Last updated:** 2026-07-07 · **Document version:** 1.3
+**Last updated:** 2026-07-14 · **Document version:** 1.4
 
-This guide is for Red Hat consultants and customer platform teams who need to mirror and upgrade OLM-based operators in disconnected or air-gapped OpenShift environments. It focuses on the part that usually causes real project delays: decision quality. In air-gap programs, every mirror run has cost (time, bandwidth, media handling, security review, and change windows), so the goal is not to mirror everything. The goal is to mirror exactly what your cluster needs, on a supported path, with predictable operational outcomes.
+This guide is for Red Hat consultants and customer platform teams who need to mirror and upgrade OLM-based operators in disconnected or air-gapped OpenShift environments.
+
+It focuses on the part that usually causes real project delays: **decision quality**. In air-gap programs, every mirror run has cost - time, bandwidth, media handling, security review, and change windows. The goal is not to mirror everything. The goal is to mirror exactly what your cluster needs, on a supported path, with predictable operational outcomes.
 
 The official OpenShift and `oc-mirror` documentation already defines supported commands, schemas, and workflows. This guide is a companion to those references and focuses on practical execution choices:
 
-- choosing the exact supported target version from the support matrix and checking supportability quickly
-- selecting the right channel for that target and OCP version
-- minimizing mirrored content by following real upgrade edges (`replaces` and `skipRange`)
-- applying generated resources in the right order so the disconnected cluster behaves as expected
+- Choosing the exact supported target version from the support matrix
+- Selecting the right channel for that target and OCP version
+- Minimizing mirrored content by following real upgrade edges (`replaces` and `skipRange`)
+- Applying generated resources in the right order so the disconnected cluster behaves as expected
+
+After following this guide, you will be able to compute the minimal supported upgrade path for an operator, mirror only the required content, and apply it on a disconnected cluster with a predictable outcome.
 
 **What this guide is not:**
 
-- not a replacement for official product documentation, support policy, or release notes
-- not a generic Kubernetes operator tutorial
-- not a promise that one workflow fits every security boundary or customer process
+- A replacement for official product documentation, support policy, or release notes
+- A generic Kubernetes operator tutorial
+- A promise that one workflow fits every security boundary or customer process
 
 **Table of contents**
 
 - [1. Foundations](#1-foundations) - Terminology, OLM flow, mental model, compatibility matrix
-- [2. oc-mirror](#2-oc-mirror) - Setup, workflows (m2d, d2m, m2m), ImageSetConfiguration, pruned catalogs, d2m troubleshooting
-- [3. Mirror only required versions](#3-mirror-only-required-versions-skiprange-and-use-the-path-solver) - skipRange and path solver
-- [4. Install/upgrade with a mirrored catalog](#4-installupgrade-an-existing-operator-with-a-mirrored-catalog) - Cluster-side apply order and subscription
+- [2. oc-mirror](#2-oc-mirror) - Setup, workflows (m2d / d2m / m2m), ImageSetConfiguration, pruned catalogs, troubleshooting
+- [3. Mirror only required versions](#3-mirror-only-required-versions) - skipRange, `opm render`, path solver
+- [4. Install/upgrade with a mirrored catalog](#4-installupgrade-an-existing-operator-with-a-mirrored-catalog) - Cluster-side apply order, catalog retagging, Subscription patching
 - [5. References](#5-references)
 
 ---
@@ -51,32 +55,24 @@ A **package** is the top-level product name used to identify an operator offerin
 > [!NOTE]
 > In this guide, **bundle** means **bundle image** unless explicitly stated otherwise.
 
-A bundle image is one installable operator version, shipped as a non-runnable OCI image. Think of it as a container image used purely as a **delivery envelope for YAML files** — it contains no binaries, no entrypoint, and no running process. During installation, OLM creates an unpack Job that **pulls the bundle image from the container registry**, extracts the YAML manifests from it, and writes them into a `ConfigMap`. OLM does not run the bundle image as a workload.
+A bundle image is one installable operator version, shipped as a non-runnable OCI image. Think of it as a container image used purely as a **delivery envelope for YAML files** - it contains no binaries, no entrypoint, and no running process. During installation, OLM creates an unpack Job that **pulls the bundle image from the container registry**, extracts the YAML manifests from it, and writes them into a `ConfigMap`. OLM does not run the bundle image as a workload.
 
 **Directory layout.** A bundle image has two directories that OLM uses:
 
-- **`manifests/`** — YAML manifests for installation: one ClusterServiceVersion (`CSV`) describing the operator version and install strategy, and one or more `CRD` manifests required by that version.
-- **`metadata/`** — Catalog annotations used by tooling, primarily `annotations.yaml` which tells `opm` how to index the bundle into a catalog.
+- **`manifests/`** - YAML manifests for installation: one ClusterServiceVersion (`CSV`) describing the operator version and install strategy, and one or more `CRD` manifests required by that version.
+- **`metadata/`** - Catalog annotations used by tooling, primarily `annotations.yaml` which tells `opm` how to index the bundle into a catalog.
 
 Some bundles include additional directories (e.g. `tests/` for operator scorecard tests), but OLM only reads `manifests/` and `metadata/`.
 
-The bundle unpack Job extracts these manifests into a `ConfigMap`. OLM controllers then use that unpacked content during `InstallPlan` execution and `CSV` reconciliation (explained in Section 1.2).
-
 #### 1.1.4 Channel
 
-A **channel** is an upgrade lane within a package. It is a named sequence of bundle entries and upgrade edges (for example `stable`, `release-2.13`, `latest`).
+A **channel** is an upgrade lane within a package. It is a named sequence of bundle entries and upgrade edges (for example `stable`, `release-2.13`, `latest`). Bundles within a channel are typically versioned as `x.y.z` (major.minor.patch / z-stream).
 
-Version notation is typically `x.y.z`:
-
-- `x` = major stream
-- `y` = minor stream
-- `z` = patch (z-stream)
-
-Publishers use channels to organize upgrade graphs and support streams. A package can expose multiple channels, and a bundle version can appear in more than one channel. In disconnected environments, channels usually matter less as release-cadence labels and more as metadata you must inspect carefully, because they complicate the decision of which bundles you actually need to mirror. 
+Publishers use channels to organize upgrade graphs and support streams. A package can expose multiple channels, and a bundle version can appear in more than one channel. In disconnected environments, channels usually matter less as release-cadence labels and more as metadata you must inspect carefully, because they complicate the decision of which bundles you actually need to mirror.
 
 #### 1.1.5 Catalog
 
-A **catalog** is metadata that tells OLM what packages/channels/bundles exist and how upgrades connect (`replaces`, `skipRange`). It contains upgrade-graph metadata and base64-encoded copies of bundle manifests (CSV, CRDs), but it does **not** contain the operator's runtime container images or the bundle images themselves — those are separate OCI images pulled from the registry at install time.
+A **catalog** is metadata that tells OLM what packages/channels/bundles exist and how upgrades connect (`replaces`, `skipRange`). It contains upgrade-graph metadata and base64-encoded copies of bundle manifests (CSV, CRDs), but it does **not** contain the operator's runtime container images or the bundle images themselves - those are separate OCI images pulled from the registry at install time.
 
 In a **file-based catalog (FBC)**, which is the current JSON/YAML-based catalog format that replaced the older SQLite-backed index format, channel entries reference bundle names and bundle objects include the backing bundle image reference (typically digest-resolved at mirror/install time). That is the "pointer" from package/channel metadata to actual installable content.
 
@@ -90,14 +86,16 @@ Some older releases and environments may also include **Red Hat Marketplace** (`
 
 Catalog images are versioned by OCP minor (for example `redhat-operator-index:v4.18`) and are not interchangeable across OCP minors. Modern index images carry **file-based catalog (FBC)** content. The FBC tooling is provided by **`opm`** (Operator Package Manager), which can render, validate, and serve catalog data. In this guide we primarily use `opm render` to dump catalog content to JSON for offline analysis.
 
+**FBC data structure**
+
 FBC data is a **stream of JSON objects** (one object per entity, concatenated or newline-delimited). Each object has a `schema` field that identifies its type:
 
-- `olm.package` — package definition, including a `defaultChannel` field that determines which channel OLM uses when none is specified
-- `olm.channel` — channel definition with an `entries` array; each entry has a bundle name and upgrade edges (`replaces`, `skips`, `skipRange`)
-- `olm.bundle` — bundle metadata including the bundle `image` reference, `relatedImages` (operand container images), and `properties` (which include base64-encoded manifests as `olm.bundle.object`)
-- `olm.deprecations` — optional deprecation notices targeting specific packages, channels, or bundles
+- `olm.package` - package definition, including a `defaultChannel` field that determines which channel OLM uses when none is specified
+- `olm.channel` - channel definition with an `entries` array; each entry has a bundle name and upgrade edges (`replaces`, `skips`, `skipRange`)
+- `olm.bundle` - bundle metadata including the bundle `image` reference, `relatedImages` (operand container images), and `properties` (which include base64-encoded manifests as `olm.bundle.object`)
+- `olm.deprecations` - optional deprecation notices targeting specific packages, channels, or bundles
 
-**Catalog image on-disk layout:** Inside the catalog image, FBC data lives under `/configs/`. The primary file is `/configs/index.json` (or multiple files in that directory). When the catalog pod starts, `opm serve /configs` reads these files, optionally uses a prebuilt cache at `/tmp/cache/`, and exposes the content over a gRPC service that OLM queries. This on-disk layout is important to understand because it is the same structure you replicate when building a pruned catalog image manually (see Section 2.13).
+**Catalog image on-disk layout:** Inside the catalog image, FBC data lives under `/configs/`. The primary file is `/configs/index.json` (or multiple files in that directory). When the catalog pod starts, `opm serve /configs` reads these files, optionally uses a prebuilt cache at `/tmp/cache/`, and exposes the content over a gRPC service that OLM queries. This on-disk layout is important to understand because it is the same structure you replicate when building a pruned catalog image manually (see Section 2.11).
 
 ```
 /
@@ -108,7 +106,7 @@ FBC data is a **stream of JSON objects** (one object per entity, concatenated or
     └── cache/           # opm serve cache (pogreb format)
 ```
 
-Every `olm.package` must have a `defaultChannel` that points to a channel present in the catalog; otherwise `opm validate` fails and OLM cannot serve the catalog. This becomes important when building pruned catalogs (Section 2.13) or filtering with oc-mirror (Section 2.7).
+Every `olm.package` must have a `defaultChannel` that points to a channel present in the catalog; otherwise `opm validate` fails and OLM cannot serve the catalog. This becomes important when building pruned catalogs (Section 2.11) or filtering with oc-mirror (Section 2.7).
 
 Example of rendering and querying a catalog:
 
@@ -121,8 +119,8 @@ jq -r 'select(.schema=="olm.channel") | .package, .name' catalog.json
 
 The cluster needs a Kubernetes resource that points OLM to a catalog image. There are two mechanisms, depending on OCP version:
 
-- **`CatalogSource`** (`operators.coreos.com/v1alpha1`) — Used in OCP 4.x with OLM Classic. When you create a `CatalogSource`, the Catalog Operator creates a **dedicated pod** that pulls the catalog image, runs `opm serve` inside it, and exposes the FBC content over a gRPC service. OLM then queries that pod's gRPC endpoint to resolve packages and bundles.
-- **`ClusterCatalog`** (`olm.operatorframework.io/v1`) — Used in newer OCP flows (OCP 4.17+ with OLM v1 / catalogd). Instead of creating a per-catalog pod, the **catalogd** controller pulls the catalog image, extracts the FBC content (`/configs/`), and serves it through its own HTTP API. There is no separate `opm serve` pod per catalog.
+- **`CatalogSource`** (`operators.coreos.com/v1alpha1`) - Used in OCP 4.x with OLM Classic. When you create a `CatalogSource`, the Catalog Operator creates a **dedicated pod** that pulls the catalog image, runs `opm serve` inside it, and exposes the FBC content over a gRPC service. OLM then queries that pod's gRPC endpoint to resolve packages and bundles.
+- **`ClusterCatalog`** (`olm.operatorframework.io/v1`) - Used in newer OCP flows (OCP 4.17+ with OLM v1 / catalogd). Instead of creating a per-catalog pod, the **catalogd** controller pulls the catalog image, extracts the FBC content (`/configs/`), and serves it through its own HTTP API. There is no separate `opm serve` pod per catalog.
 
 Without one of these pointing to your mirrored catalog image, OLM cannot resolve packages or channels for disconnected installs.
 
@@ -154,16 +152,18 @@ An **`InstallPlan`** is a Catalog Operator resource listing what should be insta
 
 An **`OperatorGroup`** tells OLM **which namespaces an operator is allowed to watch and manage**. Without an `OperatorGroup` in the operator's install namespace, OLM refuses to run the CSV's install strategy.
 
-**Why it exists:** A single cluster can have many operators installed in different namespaces. The `OperatorGroup` prevents scope conflicts — it defines the "tenant boundary" so two operators don't accidentally manage the same namespace or create conflicting RBAC.
+**Why it exists:** A single cluster can have many operators installed in different namespaces. The `OperatorGroup` prevents scope conflicts - it defines the "tenant boundary" so two operators don't accidentally manage the same namespace or create conflicting RBAC.
 
 **Three modes:**
 
-- **AllNamespaces** — The operator watches all namespaces. Used for cluster-wide operators like ACM, GitOps, or compliance operators. The `OperatorGroup` **resource must still exist** in the install namespace, but its `spec.targetNamespaces` list is left empty (or the field is omitted entirely), which means "all namespaces". An empty list is not the same as no `OperatorGroup` — the resource itself is what OLM checks for.
-- **SingleNamespace** — The operator watches only its own namespace. Used for namespace-scoped operators. The `spec.targetNamespaces` list contains exactly one namespace.
-- **MultiNamespace** — The operator watches a specific set of namespaces. The `spec.targetNamespaces` list contains multiple entries.
+- **AllNamespaces** - The operator watches all namespaces. Used for cluster-wide operators like ACM, GitOps, or compliance operators. The `spec.targetNamespaces` list is left empty (or omitted entirely).
+- **SingleNamespace** - The operator watches only its own namespace. The `spec.targetNamespaces` list contains exactly one namespace.
+- **MultiNamespace** - The operator watches a specific set of namespaces. The `spec.targetNamespaces` list contains multiple entries.
 
-**In practice:** Most Red Hat operators use AllNamespaces mode. When you install an operator through OperatorHub, OCP creates the `OperatorGroup` automatically in the install namespace. In disconnected environments where you create the `Subscription` manually, verify an `OperatorGroup` exists in the target namespace — if it is missing, OLM will not proceed past the `InstallPlan` phase.
+> [!TIP]
+> An empty `targetNamespaces` list is not the same as no `OperatorGroup`. The resource itself must exist in the install namespace - OLM checks for its presence, not just its content.
 
+**In practice:** Most Red Hat operators use AllNamespaces mode. When you install an operator through OperatorHub, OCP creates the `OperatorGroup` automatically in the install namespace. In disconnected environments where you create the `Subscription` manually, verify an `OperatorGroup` exists in the target namespace - if it is missing, OLM will not proceed past the `InstallPlan` phase.
 
 #### 1.1.10 Operator Lifecycle Manager (OLM)
 
@@ -217,7 +217,8 @@ flowchart TB
 
 Once the next hop is chosen, the **Catalog Operator** creates a bundle unpack Job for that specific selected bundle, whether it is the final target or an intermediate bridge. The unpack Job pulls the **bundle image** from the container registry, extracts the manifests (CSV, CRDs) from it, and writes the unpacked content into a `ConfigMap`. The **Catalog Operator** then reads that `ConfigMap` and builds the `InstallPlan`.
 
-Although FBC catalogs embed bundle manifests as base64 `olm.bundle.object` properties (the same content that lives inside the bundle image), the catalog gRPC service **deliberately strips** this embedded data from API responses when the bundle has an `image` reference (which all standard Red Hat bundles do). Core OLM therefore always pulls the actual bundle image via the unpack Job; the embedded base64 data exists for the OpenShift console, package-server, and tooling, not for installation.
+> [!NOTE]
+> FBC catalogs embed bundle manifests as base64 `olm.bundle.object` properties, but the catalog gRPC service **strips** this embedded data from API responses when the bundle has an `image` reference (which all standard Red Hat bundles do). OLM therefore always pulls the actual bundle image via the unpack Job. The embedded data exists for the OpenShift console, package-server, and tooling, not for installation.
 
 > [!IMPORTANT]
 > **Bundle images must be present in your mirror registry.** OLM pulls one bundle image per upgrade hop. If a bundle image is missing from the registry, the unpack Job fails and the upgrade stalls.
@@ -280,10 +281,8 @@ flowchart TB
   POD --> H
 ```
 
-**Notes:**
+**Key distinctions:**
 
-- The **Catalog Operator** is responsible for `Subscription` resolution, catalog queries, bundle unpack Job, `InstallPlan` creation, and execution of approved `InstallPlan`s (resource creation such as `CRD`s and `CSV`s).
-- The **OLM Operator** reconciles `CSV`s and runs the `CSV` install strategy (creating runtime resources like `Deployment`s and RBAC) after requirements are met.
 - A `CSV` must be an active member of an `OperatorGroup` before the OLM Operator runs install strategy.
 - The bundle image is used only for *unpacking* (manifests to `ConfigMap`). The **operator's runtime container image** (referenced in the `CSV`'s `Deployment` spec) is what actually runs in the operator pods.
 
@@ -324,7 +323,11 @@ This page lists each operator's supported versions, the OCP versions they run on
 1. Look up your operator in the matrix. Find the row for your currently installed version and confirm it supports your current OCP version.
 2. Find the latest version that supports your current OCP version (this is your phase-1 target if you need to upgrade the operator before upgrading OCP).
 3. Find the version that supports your target OCP version (this is your phase-2 target).
-4. Verify there is a version that spans both your current and target OCP versions, so you can bridge the OCP upgrade without the operator running unsupported. If no single version spans both, you need an intermediate OCP hop where you upgrade the operator. In some cases, teams accept the risk of temporarily running an operator on an unsupported OCP version (e.g. the operator still functions but Red Hat cannot provide support for that combination). If you are considering this, consult with Red Hat support beforehand and document the risk window in your change plan.
+4. Verify there is a version that spans both your current and target OCP versions, so you can bridge the OCP upgrade without the operator running unsupported.
+   - If no single version spans both, you need an intermediate OCP hop where you upgrade the operator first.
+
+> [!WARNING]
+> In some cases, teams accept the risk of temporarily running an operator on an unsupported OCP version (the operator still functions but Red Hat cannot provide support for that combination). If you are considering this, consult with Red Hat support beforehand and document the risk window in your change plan.
 
 **Example:** If ACM 2.13 supports OCP 4.16-4.19 and ACM 2.15 supports OCP 4.18-4.21, then on OCP 4.18 you can upgrade ACM from 2.13 to 2.15, and then safely upgrade OCP to 4.20 while ACM 2.15 still supports it.
 
@@ -334,9 +337,7 @@ This page lists each operator's supported versions, the OCP versions they run on
 
 ## 2. oc-mirror
 
-Key terms (Operator, Package, Catalog, ImageSetConfiguration, etc.) are defined in **Section 1**.
-
-oc-mirror is the supported Red Hat tool for copying OpenShift and operator content from external registries (such as `registry.redhat.io`) into your own registry or onto disk. In disconnected or air-gapped environments, clusters cannot pull images from the internet; oc-mirror runs on a connected host (or bastion) to mirror the content you need, so you can then move it across the boundary and serve it from an internal registry.
+Key terms (Operator, Package, Catalog, ImageSetConfiguration, etc.) are defined in **Section 1**. This section covers how to set up, configure, and run oc-mirror for disconnected mirroring workflows.
 
 ### 2.1 What oc-mirror does
 
@@ -360,11 +361,9 @@ Three workflows cover different connectivity patterns:
 
 **Destination prefixes:** For **m2d** the destination uses the `file://` prefix (local directory). For **d2m** and **m2m** the destination uses the `docker://` prefix (container registry).
 
-For a full air-gap, you typically run **m2d** on a connected machine, transfer the tarballs, then run **d2m** on a host inside the secure network. If you have a bastion that can see both sides, **m2m** avoids the intermediate disk step.
+For a full air-gap, you typically run **m2d** on a connected machine, transfer the tarballs, then run **d2m** on a host inside the secure network. If you have a bastion that can see both sides, **m2m** avoids the intermediate disk step. It can also be used for internal-to-internal promotion when the host can reach both source and destination registries with valid credentials for each.
 
-`m2m` is still mirror-to-mirror. In practice, it can be used for internal-to-internal promotion if the host can reach both source and destination registries and has valid credentials for both. The same reachability, auth, and policy checks still apply.
-
-**Internal cache registry:** Across all workflows, oc-mirror runs an **embedded container registry** on `localhost:55000` (configurable with `--port`) that acts as a local image cache. During m2d, pulled images are stored in this cache before being archived into tarballs. During d2m, the tarball is extracted into this cache, and images are pushed from it to the destination registry. This cache registry is transient — it runs only while oc-mirror is active and is not exposed outside the host. Understanding this is important for the d2m troubleshooting workaround in Section 2.14.
+**Internal cache registry:** Across all workflows, oc-mirror runs an **embedded container registry** on `localhost:55000` (configurable with `--port`) that acts as a local image cache. During m2d, pulled images are stored in this cache before being archived into tarballs. During d2m, the tarball is extracted into this cache, and images are pushed from it to the destination registry. This cache registry is transient - it runs only while oc-mirror is active and is not exposed outside the host. Understanding this is important for the d2m troubleshooting workaround in Section 2.12.
 
 ### 2.3 Set up oc-mirror
 
@@ -372,7 +371,8 @@ For a full air-gap, you typically run **m2d** on a connected machine, transfer t
 
 Download oc-mirror from the [Red Hat Hybrid Cloud Console](https://console.redhat.com/openshift/downloads): **OpenShift disconnected installation tools** → **OpenShift Client (oc) mirror plugin** → choose your OS and architecture → Download.
 
-On **aarch64**, **ppc64le**, and **s390x**, oc-mirror v2 is supported only for OpenShift Container Platform 4.14 and later.
+> [!NOTE]
+> On **aarch64**, **ppc64le**, and **s390x**, oc-mirror v2 is supported only for OpenShift Container Platform 4.14 and later.
 
 The binary is not tied to a single OCP minor version. The coupling to a specific release is in your **ImageSetConfiguration** (e.g. which catalog image tag you use, such as `redhat-operator-index:v4.18`). Use the build that your OpenShift toolchain policy expects and confirm behavior with:
 
@@ -430,14 +430,14 @@ If your system uses another path (e.g. `~/.config/containers/auth.json` on some 
 Example with an explicit auth file:
 
 ```bash
-oc-mirror --authfile /etc/mirror/pull-secret -c config.yaml file:///mirror-dir --v2
+oc-mirror --authfile /etc/mirror/pull-secret --config config.yaml file:///mirror-dir --v2
 ```
 
 ### 2.4 What you need before mirroring
 
-Before you run oc-mirror you need:
+The following checklist summarizes prerequisites from the sections above. Confirm each item before starting a mirror run:
 
-1. **ImageSetConfiguration** - A YAML file (e.g. `config.yaml`) that specifies what to mirror: platform channels, operator catalogs and packages/channels/versions, and any additional images. See section 2.7 for how to define it.
+1. **ImageSetConfiguration** - A YAML file (e.g. `config.yaml`) that specifies what to mirror: platform channels, operator catalogs and packages/channels/versions, and any additional images. See Section 2.7 for how to define it.
 2. **Destination** - For **m2d**: a local directory path with the `file://` prefix (e.g. `file:///mnt/usb/mirror-dir`). For **d2m** or **m2m**: a registry URL with the `docker://` prefix (e.g. `docker://registry.example.com:5000`).
 3. **Credentials** - Auth file for the source registry (and for d2m/m2m, access to the destination registry as needed).
 
@@ -454,7 +454,7 @@ Example production-style m2d command:
 
 ```bash
 oc-mirror \
-  -c imagesetconfig.yaml \
+  --config imagesetconfig.yaml \
   file:///mnt/usb/mirror-dir \
   --v2 \
   --retry-times 5 \
@@ -466,8 +466,17 @@ oc-mirror \
 
 Do not confuse these two directories:
 
-- **Workspace** - The `file://` path you pass on the command line. For **m2d** it holds tarballs and `working-dir/`. For **m2m** it holds only metadata (no tarballs). Only the tarballs cross the air-gap; `working-dir/` is recreated from the tarballs when you run d2m on the other side.
-- **Cache** - An internal directory (default under `$HOME`; override with `--cache-dir`; confirm with `oc-mirror --v2 --help`) where oc-mirror stores blobs and metadata for performance. It is separate from the workspace. Do not transfer the cache across the air-gap. Deleting it does not delete your tarballs; the next run will re-download more. If local disk is full, clearing cache is a valid recovery action to free space and allow the next run.
+**Workspace** - The `file://` path you pass on the command line.
+
+- For **m2d**, it holds tarballs (`mirror_seq*.tar`) and `working-dir/` (metadata, sequence state, cluster-resources).
+- For **m2m**, it holds only metadata (no tarballs).
+- Only the tarballs cross the air-gap. `working-dir/` is recreated from the tarballs when you run d2m on the other side.
+
+**Cache** - An internal directory (default under `$HOME`; override with `--cache-dir`) where oc-mirror stores blobs and metadata for performance.
+
+- It is separate from the workspace. Do not transfer the cache across the air-gap.
+- Deleting it does not delete your tarballs; the next run will re-download what it needs.
+- If local disk is full, clearing the cache is a valid recovery action.
 
 ### 2.7 ImageSetConfiguration
 
@@ -500,7 +509,14 @@ mirror:
 
 **Channel names** are publisher-defined labels (e.g. `release-2.13`, `stable`, `latest`). There is no global convention. In disconnected environments, treat a channel primarily as an **upgrade-graph identifier**, not as a release-cadence promise. Prefer explicit stream channels when they exist (for example `release-2.13`, `stable-2.9`, `v1.0.x`) and avoid relying on generic aliases such as `stable` or `latest` unless the vendor documents them for your version.
 
-**minVersion / maxVersion:** In current v2 behavior, omitting `maxVersion` keeps the lower bound while allowing newer z-stream content in later runs. Omitting both typically mirrors channel head behavior for the selected scope. Validate on your exact binary with `oc-mirror --v2 --help`. If you set version bounds but do not name a channel, oc-mirror can use the package **default channel**, which is sometimes not the one supported for your OCP version - always name the channel explicitly. If your filtered channel set excludes the upstream package default, use the package `defaultChannel` field in the ImageSetConfiguration so the filtered catalog remains internally consistent.
+**minVersion / maxVersion:**
+
+- Omitting `maxVersion` keeps the lower bound while allowing newer z-stream content in later runs.
+- Omitting both typically mirrors channel head behavior for the selected scope.
+- If you set version bounds but do not name a channel, oc-mirror can use the package **default channel**, which is sometimes not the one supported for your OCP version. Always name the channel explicitly.
+- If your filtered channel set excludes the upstream package default, use the package `defaultChannel` field in the ImageSetConfiguration so the filtered catalog remains internally consistent.
+
+Validate on your exact binary with `oc-mirror --v2 --help`.
 
 **Default channel requirement:** Every filtered catalog must have a valid `defaultChannel` for each package. If your ISC's channel list excludes the upstream package default, you **must** set `packages.defaultChannel` to one of the retained channels. Omitting it causes a hard error at filter time:
 
@@ -514,7 +530,7 @@ This error comes from the `catalog-filter` library that oc-mirror v2 uses intern
 |----------------------|-----------------------------------|--------|
 | Set to a retained channel | N/A | Override applied; original ignored |
 | Omitted | Yes | Original kept; no error |
-| Omitted | No (filtered out) | **Hard error** — mirror refuses to proceed |
+| Omitted | No (filtered out) | **Hard error** - mirror refuses to proceed |
 
 Setting `defaultChannel` does **not** cause that channel to be mirrored. It only overrides the metadata in the filtered `olm.package` entry. The channel must also appear in the `channels` list (or `channels` must be omitted entirely to include all channels).
 
@@ -528,13 +544,14 @@ When in doubt, use `--dry-run` to validate your ImageSetConfiguration before com
 > [!WARNING]
 > You must use **explicit registry hostnames** for every image listed under `additionalImages` (e.g. `quay.io/org/image:tag` or `registry.redhat.io/ubi8/ubi:latest`). Otherwise oc-mirror v2 mirrors them to incorrect target paths silently.
 
-### 2.8 Advanced version-selection workflow
+> [!TIP]
+> For advanced version-selection workflows (`skipRange`, `opm render`, and the path solver script), see **Section 3**.
 
-Detailed minimal-version planning (`skipRange`, `opm render`, and the path solver script) is covered in **Section 3**.
+### 2.8 Running m2d, d2m, and m2m
 
-### 2.9 Running m2d, d2m, and m2m
+**m2d (connected):** Destination is `file:///path/to/mirror-dir`. Output includes `mirror_seq1_000000.tar` (and more for large runs) plus `working-dir/` (metadata, sequence state, cluster-resources).
 
-**m2d (connected):** Destination is `file:///path/to/mirror-dir`. Output: `mirror_seq1_000000.tar` (and more for large runs) plus `working-dir/` (metadata, sequence state, cluster-resources). Transfer **only the tarballs**; leave `working-dir/` behind. It is regenerated when you run d2m.
+Transfer **only the tarballs**; leave `working-dir/` behind. It is regenerated when you run d2m.
 
 | What              | Transfer? |
 | ----------------- | --------- |
@@ -544,7 +561,7 @@ Detailed minimal-version planning (`skipRange`, `opm render`, and the path solve
 **d2m (air-gapped):** Copy tarballs to the host. The `--from` argument must point to the directory that *contains* the `mirror_seq*.tar` files (not to `working-dir/`). Then:
 
 ```bash
-oc-mirror -c imagesetconfig.yaml \
+oc-mirror --config imagesetconfig.yaml \
   --from file:///path/to/mirror-dir \
   docker://airgapped-registry:5000 \
   --v2 --retry-times 3
@@ -553,7 +570,7 @@ oc-mirror -c imagesetconfig.yaml \
 oc-mirror reads the tarballs from that directory, recreates `working-dir/` locally, and pushes the images to the registry.
 
 > [!IMPORTANT]
-> **The `--config` flag is mandatory for d2m**, even though the ISC is embedded inside the tarball. The tarball contains both the original ISC (as `isc_{timestamp}` at the tar root) and a pinned copy (`working-dir/isc_pinned_{timestamp}.yaml`), but d2m deliberately ignores the embedded copies. The `--config` ISC drives `CollectAll`, which determines what actually gets pushed — d2m does not push everything in the archive.
+> **The `--config` flag is mandatory for d2m**, even though the ISC is embedded inside the tarball. The tarball contains both the original ISC (as `isc_{timestamp}` at the tar root) and a pinned copy (`working-dir/isc_pinned_{timestamp}.yaml`), but d2m deliberately ignores the embedded copies. The `--config` ISC drives `CollectAll`, which determines what actually gets pushed - d2m does not push everything in the archive.
 
 **Subset push: using a smaller ISC for d2m.** You can pass a different (smaller) ISC during d2m to push only a subset of what the tarball contains. The operator collector only processes operators listed in the ISC; any operators in the archive but not in the ISC are silently skipped. This is useful when a single m2d run mirrors content for multiple clusters or environments, but each d2m run targets a specific scope.
 
@@ -563,38 +580,46 @@ d2m --config subset-a.yaml      → pushes only 2 of those operators
 d2m --config subset-b.yaml      → pushes 3 others (same tarball, separate run)
 ```
 
-The same applies to `mirror.platform`, `additionalImages`, and `helm` sections — omitting a section from the d2m ISC means that content is not pushed even if it is in the archive.
+The same applies to `mirror.platform`, `additionalImages`, and `helm` sections - omitting a section from the d2m ISC means that content is not pushed even if it is in the archive.
 
 > [!CAUTION]
 > Do not change the package/channel/version filters for an operator between m2d and d2m. d2m reuses pre-built catalog metadata from `working-dir/` by matching a hash of the operator's ISC entry. If the hash does not match (because you changed `minVersion`, added a channel, etc.), d2m attempts to re-filter the catalog, which can fail in a disconnected environment. The safe pattern is: start from the `isc_pinned_{timestamp}.yaml` that m2d generated (it is inside `working-dir/` after unarchive) and **remove** entries you do not need, rather than modifying filter parameters.
 
 **m2m (bastion):** Use `--workspace file:///path/to/workspace` and a `docker://` destination. No tarballs; content goes straight to the registry. The workspace holds only metadata.
 
-**Incremental runs:** oc-mirror tracks state. Running m2d again with the same workspace mirrors only what changed. Use `--since 2025-06-01` to restrict to content newer than a date. Delete the workspace only when you need a full reseed.
+**Incremental runs:** oc-mirror tracks state. Running m2d again with the same workspace mirrors only what changed. Use `--since YYYY-MM-DD` to restrict to content newer than a date. Delete the workspace only when you need a full reseed.
 
-### 2.10 Advanced cluster-side apply/upgrade workflow
+> [!TIP]
+> For the cluster-side apply order, catalog retagging, and `Subscription` switch logic after mirroring, see **Section 4**.
 
-Detailed cluster-side apply order, catalog retagging, and `Subscription` switch logic is covered in **Section 4**.
-
-### 2.11 End-to-end operator upgrade (summary)
+### 2.9 End-to-end operator upgrade (summary)
 
 1. Determine the minimal mirror set (e.g. `opm render` + path solver or skipRange inspection).
 2. Write the ImageSetConfiguration (catalog image for your OCP minor, package, channel from support matrix, minVersion/maxVersion as needed).
 3. Run m2d with `--v2 --retry-times 5 --image-timeout 1h` (and `--authfile` if needed).
 4. Transfer only `mirror_seq*.tar` to the air-gapped side.
 5. Run d2m with `--from file:///path/to/tarballs` and `docker://your-registry`.
-6. Apply cluster resources in order (see Section 4): IDMS and ITMS, wait for Machine Config Pool (MCP) rollout, then apply signature ConfigMap (if you mirrored release images), then catalog and UpdateService manifests.
+6. Apply cluster resources in order (see Section 4):
+   - Apply `ImageDigestMirrorSet` and `ImageTagMirrorSet`.
+   - Wait for Machine Config Pool (MCP) rollout to complete.
+   - Apply signature `ConfigMap` (only if you mirrored release images).
+   - Apply catalog and `UpdateService` manifests.
 7. Update the `Subscription` (channel, source, `installPlanApproval`, `startingCSV` if desired) and approve the `InstallPlan`.
 
-### 2.12 Delete subcommand and catalog pinning
+### 2.10 Delete subcommand and catalog pinning
 
-**Deleting images from the mirror registry:** oc-mirror v2 does not auto-prune. To remove images you no longer need, use the `oc-mirror delete` subcommand in two phases: (1) with a `DeleteImageSetConfiguration` and `--generate`, oc-mirror produces a delete-images YAML; (2) run `oc-mirror delete --delete-yaml-file <path>` to remove manifests from the registry. Only manifests are deleted; run your registry's **garbage collector** to reclaim blob storage. See the [Disconnected environments documentation](https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html-single/disconnected_environments/#delete-mirror-registry-content) for the full procedure.
+**Deleting images from the mirror registry:** oc-mirror v2 does not auto-prune. To remove images you no longer need, use the `oc-mirror delete` subcommand in two phases:
 
-**Catalog pinning:** After mirror-to-disk or mirror-to-mirror runs, oc-mirror can write pinned configs (`isc_pinned_{timestamp}.yaml` and `disc_pinned_{timestamp}.yaml`) in the working directory. These reference catalogs by digest for reproducible mirrors and for use with the delete flow. See the [oc-mirror README - Catalog Pinning](https://github.com/openshift/oc-mirror/blob/main/README.md).
+1. Run with a `DeleteImageSetConfiguration` and `--generate` to produce a delete-images YAML.
+2. Run `oc-mirror delete --delete-yaml-file <path>` to remove manifests from the registry.
 
-### 2.13 Building pruned catalog images
+Only manifests are deleted; run your registry's **garbage collector** to reclaim blob storage. See the [Disconnected environments documentation](https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html-single/disconnected_environments/#delete-mirror-registry-content) for the full procedure.
 
-Instead of relying on oc-mirror's internal catalog filtering and rebuild, you can build **pruned catalog images** manually. This gives you exact control over which bundles appear in the catalog and avoids d2m issues where oc-mirror tries to reach the source registry to rebuild the catalog (see Section 2.14).
+**Catalog pinning:** After m2d or m2m runs, oc-mirror can write pinned configs (`isc_pinned_{timestamp}.yaml` and `disc_pinned_{timestamp}.yaml`) in the working directory. These reference catalogs by digest for reproducible mirrors and for use with the delete flow. See the [oc-mirror README - Catalog Pinning](https://github.com/openshift/oc-mirror/blob/main/README.md).
+
+### 2.11 Building pruned catalog images
+
+Instead of relying on oc-mirror's internal catalog filtering and rebuild, you can build **pruned catalog images** manually. This gives you exact control over which bundles appear in the catalog and avoids d2m issues where oc-mirror tries to reach the source registry to rebuild the catalog (see Section 2.12).
 
 **When to use this approach:**
 
@@ -623,10 +648,13 @@ opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 > catalog.json
 
 The filter must handle four FBC object types:
 
-- **`olm.package`** — keep packages you need; override `defaultChannel` to a retained channel
-- **`olm.channel`** — keep only channels in your upgrade path; prune the `entries` array to only kept bundles; strip `replaces` references to bundles not in the catalog (set to null); keep `skipRange` as-is (it references versions below the current, which are not in the catalog and do not need to be)
-- **`olm.bundle`** — keep only the exact bundles you need
-- **`olm.deprecations`** — keep only if all referenced bundles exist in the pruned catalog; exclude entries referencing removed bundles (otherwise `opm validate` fails)
+- **`olm.package`** - keep packages you need; override `defaultChannel` to a retained channel
+- **`olm.channel`** - keep only channels in your upgrade path:
+  - Prune the `entries` array to only kept bundles
+  - Strip `replaces` references to bundles not in the catalog (set to null)
+  - Keep `skipRange` as-is (it references versions below the current, which are not in the catalog and do not need to be)
+- **`olm.bundle`** - keep only the exact bundles you need
+- **`olm.deprecations`** - keep only if all referenced bundles exist in the pruned catalog; exclude entries referencing removed bundles (otherwise `opm validate` fails)
 
 Example jq filter for a single-bundle channel (the head):
 
@@ -685,7 +713,7 @@ podman build --squash-all -f Dockerfile -t redhat-operator-index:v4.18-pruned .
 ```
 
 > [!IMPORTANT]
-> The `--squash-all` flag is required. Without it, the base image layers (which contain the **full original catalog** at up to ~4 GB) remain in the image even though we deleted `/configs/*` in a later layer. Container layers are additive — `RUN rm` only adds whiteout markers; the original data stays in lower layers. `--squash-all` collapses everything into a single layer where deleted files are truly gone, reducing the image from multi-GB to ~1 GB (RHEL base + opm binary + your small pruned catalog).
+> The `--squash-all` flag is required. Without it, the base image layers (which contain the **full original catalog** at up to ~4 GB) remain in the image even though we deleted `/configs/*` in a later layer. Container layers are additive - `RUN rm` only adds whiteout markers; the original data stays in lower layers. `--squash-all` collapses everything into a single layer where deleted files are truly gone, reducing the image from multi-GB to ~1 GB (RHEL base + opm binary + your small pruned catalog).
 
 **Step 5: Save and transfer**
 
@@ -706,7 +734,7 @@ podman push internal-registry:5000/redhat/redhat-operator-index:v4.18-pruned
 > [!IMPORTANT]
 > The pruned catalog image contains only **catalog metadata** (which bundles exist, their upgrade edges, and their `relatedImages` references). You still need to mirror the actual **bundle images and operand images** using oc-mirror with the corresponding ISC. The pruned catalog and the oc-mirror ISC are complementary: the ISC drives the image mirroring; the pruned catalog drives what OLM sees on the cluster.
 
-### 2.14 d2m troubleshooting: catalog resolution and `registries.conf`
+### 2.12 d2m troubleshooting: catalog resolution and `registries.conf`
 
 A known class of d2m failures involves oc-mirror trying to reach the source registry (`registry.redhat.io`) during the disk-to-mirror phase, which should be fully offline. The typical error is:
 
@@ -722,7 +750,7 @@ error: collect catalog "registry.redhat.io/redhat/redhat-operator-index:v4.18":
 
 2. **Race condition during m2d (OCPBUGS-81712).** If the catalog tag is resolved to different digests during the collection and mirroring phases of m2d (because Red Hat updated the tag between the two calls), the tarball contains inconsistent data. **Fix:** update to the latest oc-mirror binary, which pins catalog digests at the start of m2d.
 
-3. **Incomplete m2d run.** The tarball is missing filtered catalog metadata because m2d did not complete catalog filtering. The d2m `filterOperator` code path falls through to `EnsureCatalogInOCIFormat`, which tries `docker://registry.redhat.io/...`.
+3. **Incomplete m2d run.** The tarball is missing filtered catalog metadata because m2d did not complete catalog filtering. The d2m `filterOperator` code path falls through to `EnsureCatalogInOCIFormat`, which tries `docker://registry.redhat.io/...`. **Fix:** re-run m2d to completion, or use the `registries.conf` workaround below.
 
 **Workaround with `registries.conf`:**
 
@@ -752,23 +780,18 @@ This works because the catalog image is already in the local cache (loaded from 
 > [!NOTE]
 > There is no `--registries-conf` CLI flag in oc-mirror v2. The `CONTAINERS_REGISTRIES_CONF` environment variable is the mechanism. If unset, the `containers/image` library checks standard paths (`/etc/containers/registries.conf`, then `$HOME/.config/containers/registries.conf`).
 
-## 3. Compute the minimal logical upgrade path (`skipRange`) and use the path solver
+## 3. Mirror only required versions
 
-If you hear "`skipVersion`", read it as `skipRange` in FBC metadata. The practical objective is to compute the **minimal logical upgrade path** from your current version to your supported target version. That path is derived from the catalog’s upgrade edges (`replaces`, `skips`, `skipRange`). Whether stock `oc-mirror` can represent that path *exactly* is a second question; in practice, the generated ImageSetConfiguration often uses `minVersion` to approximate the exact path with floating heads.
+The practical objective is to compute the **minimal logical upgrade path** from your current version to your supported target version. That path is derived from the catalog's upgrade edges (`replaces`, `skips`, `skipRange`). Whether stock oc-mirror can represent that path *exactly* is a second question; in practice, the generated ImageSetConfiguration often uses `minVersion` to approximate the exact path with a floating channel head (meaning newer z-stream patches released after your mirror run may also be included).
 
-### 3.1 Why we need the catalog as JSON
+> [!NOTE]
+> If you hear "`skipVersion`" in conversation, read it as `skipRange` in FBC metadata. There is no `skipVersion` field.
 
-The catalog image (e.g. `redhat-operator-index:v4.18`) is an OCI image that holds **file-based catalog (FBC)** data: package definitions, channel definitions, and bundle metadata including upgrade edges. To decide *which* bundles to mirror, we need to query that metadata-e.g. “which channels contain the target bundle?”, “what is the package `defaultChannel`?”, “what is the `skipRange` of the target bundle?”, “what are the `replaces` / `skips` edges?”. The catalog image itself is not directly queryable from the command line. We therefore **dump** the FBC content to a single, machine-readable file. The standard way to do that is to **render** the catalog; the renderer outputs a **stream of JSON objects** (one JSON object per FBC entity: package, channel, bundle). Saving that stream to a file (e.g. `catalog.json`) gives us something we can query with `jq` or feed into a script to compute the minimal logical upgrade path.
+### 3.1 Render the catalog to JSON
 
-### 3.2 What is `opm` and why run `opm render`?
+The catalog image (e.g. `redhat-operator-index:v4.18`) contains FBC data (package definitions, channel definitions, and bundle metadata including upgrade edges) but it is not directly queryable from the command line. To inspect upgrade paths, you need to **render** the catalog to a local JSON file.
 
-**`opm`** (Operator Package Manager) is the Operator Framework tool used to build and inspect FBC catalogs. It is shipped with OpenShift and used under the hood by OLM and catalog builders. When you run:
-
-```bash
-opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 > catalog.json
-```
-
-`opm` pulls the catalog image, reads the FBC content inside it, and **renders** it as a stream of JSON objects. Each object has a `schema` field (e.g. `olm.package`, `olm.channel`, `olm.bundle`) and the fields that define that entity. Channel objects include `entries` with bundle names and their `replaces` / `skipRange`; bundle objects include the bundle image reference. We run `opm render` so we have a single file that describes the entire catalog and its upgrade graph, which we can then query to decide the minimal mirror set.
+**`opm`** (Operator Package Manager) is the Operator Framework tool for building and inspecting FBC catalogs. Running `opm render` pulls the catalog image and outputs a stream of JSON objects (one per FBC entity: `olm.package`, `olm.channel`, `olm.bundle`). Channel objects include `entries` with bundle names and their `replaces` / `skipRange`; bundle objects include the bundle image reference.
 
 > [!TIP]
 > **Pruned render:** A raw `opm render` dump includes `olm.bundle` objects with base64-encoded manifests that account for over 90% of the file size (e.g. ~1.1 GB for `redhat-operator-index:v4.16`). The path solver and the manual `jq` queries in this guide only need `olm.package` and `olm.channel` objects. Pipe through `jq` to strip the rest:
@@ -779,19 +802,13 @@ opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 \
   > catalog.json
 ```
 
-This produces a file of ~830 KB instead of ~1.1 GB, and the path solver runs in under 2 seconds instead of 30.
+This produces a file of ~830 KB instead of ~1.1 GB, and the path solver runs in under 2 seconds instead of 30. All examples below assume you have a `catalog.json` produced this way.
 
-### 3.3 Doing it manually (without the path solver script)
+### 3.2 Doing it manually (without the path solver script)
 
 You can compute the minimal logical path and write the ImageSetConfiguration by hand:
 
-1. **Render the catalog** (requires network access to pull the catalog image, or a copy of it). Use the pruned pipeline from Section 3.2 for faster queries:
-
-   ```bash
-   opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 \
-     | jq -c 'if .schema == "olm.package" or .schema == "olm.channel" then . else empty end' \
-     > catalog.json
-   ```
+1. **Render the catalog** using the pruned pipeline from Section 3.1 (if you have not already).
 
 2. **List channels for your package** (replace `PACKAGE` with e.g. `advanced-cluster-management`):
 
@@ -805,38 +822,21 @@ You can compute the minimal logical path and write the ImageSetConfiguration by 
    jq -r 'select(.schema=="olm.channel" and .package=="PACKAGE" and .name=="CHANNEL") | .entries[] | [.name, .replaces, .skipRange] | @tsv' catalog.json
    ```
 
-4. **Decide the path** - From your current version (e.g. 2.11.4) and target version (e.g. 2.13.5), check whether the target bundle’s `skipRange` includes your current version (e.g. `>=2.11.0 <2.13.5` means you can jump directly). If not, find the smallest bridge bundle that *does* connect, then repeat until you reach the installed version. Omitted intermediate minors are acceptable if the retained bundles still form a valid path through `skipRange`, `skips`, or `replaces`.
+4. **Decide the path** - From your current version (e.g. 2.11.4) and target version (e.g. 2.13.5), check whether the target bundle's `skipRange` includes your current version (e.g. `>=2.11.0 <2.13.5` means you can jump directly). If not, find the smallest bridge bundle that *does* connect, then repeat until you reach the installed version. Omitted intermediate minors are acceptable if the retained bundles still form a valid path through `skipRange`, `skips`, or `replaces`.
 
 5. **Write the ImageSetConfiguration** - Add a `packages` entry with the right `channels` and `minVersion` / `maxVersion` for the path you identified. Use the support matrix to choose the supported target version first, then use the catalog metadata to determine which channel(s) contain the required bridge and target bundles. If your filtered channels do not include the upstream package default, set `packages.defaultChannel` to one of the retained channels, usually the target channel.
 
 This is error-prone for multi-channel or long chains, so the next subsection introduces a script that automates the path computation and snippet generation.
 
-### 3.4 Using the path solver script
+### 3.3 Using the path solver script
 
 The **path solver script** (`resolve-operator-path.sh`, in this repo next to the guide) automates the logic above: it reads the same `catalog.json`, finds the package and channel metadata, computes the shortest valid logical upgrade path from your current version to the target version using `replaces`, `skips`, and `skipRange`, and prints an ImageSetConfiguration snippet you can paste into your config. Requirements: **Bash 4+** and **jq**.
 
-**Support matrix check (before any mirroring):**
-
-1. Confirm cluster OCP version:
-
-   ```bash
-   oc get clusterversion version -o jsonpath='{.status.desired.version}{"\n"}'
-   ```
-
-2. Open the operator product documentation and find its supportability/compatibility matrix.
-3. Match your OCP minor to the newest **supported target bundle version**.
-4. Use the catalog metadata to determine which channel or channels contain that target and any required bridge bundles.
-5. Record that version/channel decision and use it as the boundary for the steps below.
+Before running the path solver, confirm you have completed the support matrix check described in **Section 1.4** and identified a supported target version and channel for your OCP minor.
 
 **Recommended workflow:**
 
-1. Render the catalog (if you have not already). Use the pruned pipeline from Section 3.2:
-
-   ```bash
-   opm render registry.redhat.io/redhat/redhat-operator-index:v4.18 \
-     | jq -c 'if .schema == "olm.package" or .schema == "olm.channel" then . else empty end' \
-     > catalog.json
-   ```
+1. Render the catalog using the pruned pipeline from Section 3.1 (if you have not already).
 
 2. Run the path solver with package name, current version, target version, path to `catalog.json`, and (optionally) catalog image:
 
@@ -849,26 +849,30 @@ The **path solver script** (`resolve-operator-path.sh`, in this repo next to the
      registry.redhat.io/redhat/redhat-operator-index:v4.18
    ```
 
-3. Use the generated ImageSetConfiguration snippet as your base. Treat the printed path as the exact logical path and the emitted `minVersion`-only config as a deliberate floating-head approximation.
+3. Use the generated ImageSetConfiguration snippet as your base. The printed path is the exact logical path; the emitted `minVersion`-only config is a deliberate approximation, as newer z-stream patches in the same channel may also be mirrored if they are released before your mirror run.
 4. Keep channel choice aligned with the inspected catalog metadata and your supported target version. If you must retain multiple channels, set `packages.defaultChannel` intentionally and keep `Subscription.channel` explicit during cluster-side upgrades.
 5. Mirror and publish as usual (`m2d`/`d2m` or `m2m`), then verify the required bridge and target bundles are actually present in your mirrored catalog.
 
 ## 4. Install/upgrade an existing operator with a mirrored catalog
 
-This section is the practical "cluster-side" procedure after mirror publish. Terms used here are defined in **Section 1.1**.
+This section is the practical "cluster-side" procedure after mirroring is complete. Before starting, confirm that:
+
+- The d2m or m2m run completed successfully (Section 2.8)
+- The generated resources are available in `working-dir/cluster-resources/`
+
+Terms used here are defined in **Section 1.1**.
+
+> [!CAUTION]
+> If you push a later oc-mirror run to the same catalog image tag in your registry, the new catalog image replaces the previous one silently, even if the `CatalogSource` resource name is different. Always retag mirrored catalog images to a stable, unique tag before applying them on the cluster.
 
 **Recommended operator-focused workflow:**
 
-1. **Publish the mirrored registry configuration on the cluster** - Apply the generated `ImageDigestMirrorSet` and `ImageTagMirrorSet` resources from `working-dir/cluster-resources/`. Treat this as one operational task: mirror-set changes can update node-level registry configuration and may trigger disruptive node drains or a MachineConfig rollout, especially when existing `IDMS` / `ITMS` objects are modified or deleted. Schedule this work inside a maintenance window and wait for any required MCP rollout to finish before continuing.
+1. **Publish the mirrored registry configuration on the cluster** - Apply the generated `ImageDigestMirrorSet` and `ImageTagMirrorSet` resources from `working-dir/cluster-resources/`.
 
-2. **Publish a dedicated mirrored catalog and retag its image intentionally** - For OLM operators in disconnected environments, do **not** rely only on renaming the `CatalogSource` resource. If you push a later oc-mirror run to the same catalog image tag in your registry, the new catalog image replaces the previous one even if the Kubernetes resource name is different. The safe pattern is:
-   - give each mirrored catalog image a new, stable tag in your registry (for example by date, run number, or operator scope)
-   - create or update a dedicated `CatalogSource` or `ClusterCatalog` that points `spec.image` at that exact retagged image
-   - give the API resource a unique name as well, so applying a later run does not replace the older catalog resource unintentionally
+> [!CAUTION]
+> Mirror-set changes can trigger disruptive node drains or a MachineConfig rollout, especially when existing IDMS/ITMS objects are modified or deleted. Schedule this work inside a maintenance window and wait for any required MCP rollout to finish before continuing.
 
-   In practice, an oc-mirror `d2m` or `m2m` run pushes the catalog image into your internal registry under the default generated repository/tag path for that run. If you leave that image reference "as is", a later mirror run can push a newer catalog image to the same destination and silently replace the previous catalog content. To preserve an older catalog for rollback or side-by-side testing, retag it to a new stable tag either:
-   - immediately after the current `d2m` run completes, or
-   - before you let a later `d2m` run reuse that default catalog destination
+2. **Retag the mirrored catalog image and create a dedicated catalog resource** - Give each mirrored catalog image a new, stable tag in your registry (for example by date, run number, or operator scope). Create or update a dedicated `CatalogSource` or `ClusterCatalog` that points `spec.image` at that exact retagged image, with a unique resource name.
 
    Example with `podman`:
 
@@ -908,7 +912,13 @@ oc -n <operator-namespace> patch subscription <subscription-name> \
   }}'
 ```
 
-4. **If needed, force the initial target** - If you must force the first selected bundle for a controlled starting point, set `startingCSV` explicitly in the `Subscription` spec.
+4. **If needed, force the initial target** - To control which bundle OLM selects first, set `startingCSV` in the `Subscription` spec (see Section 1.1.7 for context):
+
+```bash
+oc -n <operator-namespace> patch subscription <subscription-name> \
+  --type merge \
+  --patch '{"spec":{"startingCSV":"<operator-name>.v<version>"}}'
+```
 
 5. **Approve the pending `InstallPlan` and validate the result** - Once the `Subscription` points to the correct catalog and channel, approve the `InstallPlan` if you are using manual approval, then verify the resulting `CSV` phase and operator deployment health.
 
@@ -917,6 +927,7 @@ oc get installplan -n <operator-namespace>
 oc patch installplan <plan-name> -n <operator-namespace> \
   --type merge --patch '{"spec":{"approved":true}}'
 oc get csv -n <operator-namespace>
+oc get pods -n <operator-namespace>
 ```
 
 6. **Keep old catalog images and catalog resources until validation is complete** - Do not delete or overwrite the previous mirrored catalog immediately. Keep the older tagged catalog image and older `CatalogSource` until the new upgrade is validated, then prune intentionally.
@@ -925,13 +936,21 @@ oc get csv -n <operator-namespace>
 
 ## 5. References
 
-- [oc-mirror README (v2)](https://github.com/openshift/oc-mirror/blob/main/README.md)
-- [oc-mirror on GitHub](https://github.com/openshift/oc-mirror)
-- [Mirroring images for a disconnected installation using the oc-mirror plugin v2](https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html-single/disconnected_environments/#mirroring-images-disconnected-installation-oc-mirror-plugin-v2_disconnected-environments) (official chapter)
-- [OCP Disconnected installation mirroring](https://docs.openshift.com/container-platform/latest/installing/disconnected_install/installing-mirroring-disconnected.html) - [versioned (4.18)](https://docs.openshift.com/container-platform/4.18/installing/disconnected_install/installing-mirroring-disconnected.html)
-- [OCP Operator Upgrade Information (OUIC)](https://access.redhat.com/labs/ocpouic/)
-- [Red Hat Operator Supportability and Interoperability Guide (compatibility matrix)](https://access.redhat.com/support/policy/updates/openshift_operators) - authoritative source for operator version/OCP version support ranges, GA dates, and support lifecycle end dates
-- [Red Hat solution 7061405 - EUS shortest path and oc-mirror](https://access.redhat.com/solutions/7061405)
-- [Red Hat solution 7128498 - d2m encountering errors (dial tcp)](https://access.redhat.com/solutions/7128498) - known issue where d2m tries to reach the source registry
+**Official documentation**
+
+- [Mirroring images for a disconnected installation using the oc-mirror plugin v2](https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html-single/disconnected_environments/#mirroring-images-disconnected-installation-oc-mirror-plugin-v2_disconnected-environments) - official chapter for OCP 4.18
+- [OCP Disconnected installation mirroring (4.18)](https://docs.openshift.com/container-platform/4.18/installing/disconnected_install/installing-mirroring-disconnected.html)
+- [Red Hat Operator Supportability and Interoperability Guide](https://access.redhat.com/support/policy/updates/openshift_operators) - authoritative source for operator version/OCP version support ranges, GA dates, and support lifecycle end dates
 - [File-based catalogs (OLM)](https://olm.operatorframework.io/docs/reference/file-based-catalogs/)
+
+**Tools and labs**
+
+- [oc-mirror on GitHub](https://github.com/openshift/oc-mirror) - source code and issue tracker
+- [oc-mirror README (v2)](https://github.com/openshift/oc-mirror/blob/main/README.md) - schema reference, catalog pinning, and CLI usage
+- [OCP Operator Upgrade Information (OUIC)](https://access.redhat.com/labs/ocpouic/) - interactive upgrade path calculator
+
+**Troubleshooting and knowledge base**
+
+- [Red Hat solution 7061405](https://access.redhat.com/solutions/7061405) - EUS shortest path and oc-mirror
+- [Red Hat solution 7128498](https://access.redhat.com/solutions/7128498) - d2m encountering errors (dial tcp) when trying to reach the source registry
 - [IDMS/ITMS/ICSP for disconnected OpenShift](https://kubernetes.recipes/recipes/configuration/idms-itms-disconnected-openshift/) - practical comparison of mirror configuration mechanisms
