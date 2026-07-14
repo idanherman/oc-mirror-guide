@@ -40,7 +40,7 @@ Terms are ordered to make the flow easier to follow: each concept is introduced 
 An **operator** is application-specific automation for Kubernetes (and OpenShift). In practice it is one or more controllers plus API extensions that provide additional functionality to the cluster.
 
 - **Cluster Operators** - Shipped as part of the OpenShift release payload and managed by the **Cluster Version Operator (CVO)**. During cluster installation and cluster upgrades, CVO deploys them as part of the platform lifecycle. You do not install these through OLM.
-- **Optional add-on operators** - Managed by **Operator Lifecycle Manager (OLM)** (detailed in Section 1.1.10). Unlike Cluster Operators, these are selected per environment and installed from catalogs based on your package/channel/subscription choices. This guide primarily targets these OLM-based operators.
+- **Optional add-on Operators** - Managed by **Operator Lifecycle Manager (OLM)** (detailed in Section 1.1.10). Unlike Cluster Operators, these are selected per environment and installed from catalogs based on your package/channel/subscription choices. This guide primarily targets these OLM-based operators.
 
 #### 1.1.2 Package
 
@@ -51,14 +51,14 @@ A **package** is the top-level product name used to identify an operator offerin
 > [!NOTE]
 > In this guide, **bundle** means **bundle image** unless explicitly stated otherwise.
 
-A bundle image is one installable operator version, shipped as a non-runnable OCI image that carries manifests and metadata. During installation, OLM creates an unpack Job that **pulls the bundle image from the container registry**, extracts manifests from it, and writes them into a `ConfigMap`. OLM does not run the bundle image as a workload — it only reads the manifests from it.
+A bundle image is one installable operator version, shipped as a non-runnable OCI image. Think of it as a container image used purely as a **delivery envelope for YAML files** — it contains no binaries, no entrypoint, and no running process. During installation, OLM creates an unpack Job that **pulls the bundle image from the container registry**, extracts the YAML manifests from it, and writes them into a `ConfigMap`. OLM does not run the bundle image as a workload.
 
-**Directory layout.** A bundle image has two main directories:
+**Directory layout.** A bundle image has two directories that OLM uses:
 
-- **`manifests/`** - YAML manifests used for installation. Typically includes:
-  - **One ClusterServiceVersion (`CSV`)** describing that operator version and install strategy.
-  - **One or more `CRD` manifests** required by that version.
-- **`metadata/`** - Catalog annotations used by tooling. In many bundles this is primarily `annotations.yaml`; some build pipelines add related metadata files.
+- **`manifests/`** — YAML manifests for installation: one ClusterServiceVersion (`CSV`) describing the operator version and install strategy, and one or more `CRD` manifests required by that version.
+- **`metadata/`** — Catalog annotations used by tooling, primarily `annotations.yaml` which tells `opm` how to index the bundle into a catalog.
+
+Some bundles include additional directories (e.g. `tests/` for operator scorecard tests), but OLM only reads `manifests/` and `metadata/`.
 
 The bundle unpack Job extracts these manifests into a `ConfigMap`. OLM controllers then use that unpacked content during `InstallPlan` execution and `CSV` reconciliation (explained in Section 1.2).
 
@@ -97,7 +97,7 @@ FBC data is a **stream of JSON objects** (one object per entity, concatenated or
 - `olm.bundle` — bundle metadata including the bundle `image` reference, `relatedImages` (operand container images), and `properties` (which include base64-encoded manifests as `olm.bundle.object`)
 - `olm.deprecations` — optional deprecation notices targeting specific packages, channels, or bundles
 
-**Catalog image on-disk layout.** Inside the catalog image, FBC data lives under `/configs/`. The primary file is `/configs/index.json` (or multiple files in that directory). When the catalog pod starts, `opm serve /configs` reads these files, optionally uses a prebuilt cache at `/tmp/cache/`, and exposes the content over a gRPC service that OLM queries. This on-disk layout is important to understand because it is the same structure you replicate when building a pruned catalog image manually (see Section 2.13).
+**Catalog image on-disk layout:** Inside the catalog image, FBC data lives under `/configs/`. The primary file is `/configs/index.json` (or multiple files in that directory). When the catalog pod starts, `opm serve /configs` reads these files, optionally uses a prebuilt cache at `/tmp/cache/`, and exposes the content over a gRPC service that OLM queries. This on-disk layout is important to understand because it is the same structure you replicate when building a pruned catalog image manually (see Section 2.13).
 
 ```
 /
@@ -158,7 +158,7 @@ An **`OperatorGroup`** tells OLM **which namespaces an operator is allowed to wa
 
 **Three modes:**
 
-- **AllNamespaces** — The operator watches all namespaces. Used for cluster-wide operators like ACM, GitOps, or compliance operators. The `OperatorGroup` has an empty `spec.targetNamespaces` list (or the field is omitted entirely).
+- **AllNamespaces** — The operator watches all namespaces. Used for cluster-wide operators like ACM, GitOps, or compliance operators. The `OperatorGroup` **resource must still exist** in the install namespace, but its `spec.targetNamespaces` list is left empty (or the field is omitted entirely), which means "all namespaces". An empty list is not the same as no `OperatorGroup` — the resource itself is what OLM checks for.
 - **SingleNamespace** — The operator watches only its own namespace. Used for namespace-scoped operators. The `spec.targetNamespaces` list contains exactly one namespace.
 - **MultiNamespace** — The operator watches a specific set of namespaces. The `spec.targetNamespaces` list contains multiple entries.
 
@@ -172,7 +172,7 @@ With the objects above in place, OLM controllers do the orchestration:
 - **Catalog Operator** - Watches `CatalogSource`/`ClusterCatalog`, `Subscription`, and `InstallPlan`; resolves bundles and executes approved install plans.
 - **OLM Operator** - Watches `CSV`s and runs the CSV install strategy to create/update runtime resources (`Deployment`, RBAC, etc.).
 
-You will typically see `catalog-operator` and `olm-operator` pods in the `openshift-operator-lifecycle-manager` namespace.
+You will typically see `catalog-operator` and `olm-operator` pods in the `openshift-operator-lifecycle-manager` namespace (verify with `oc get pods -n openshift-operator-lifecycle-manager`).
 
 ---
 
@@ -184,28 +184,28 @@ The diagrams below break that sequence into stages. Each stage includes a short 
 
 **Stage 1: Subscription to graph resolution**
 
-The first stage is about **resolution**, not installation. The `Subscription` points to a specific catalog source. The **Catalog Operator** reads that reference, connects to the catalog pod created from the mirrored catalog image, and queries the package/channel data served from the catalog contents. At this point OLM decides whether the next hop is the channel head or an intermediate bridge bundle.
+The first stage is about **resolution**, not installation. The `Subscription` points to a `CatalogSource` (or `ClusterCatalog`). The **Catalog Operator** reads that reference and queries the catalog's package/channel data to find the next upgrade hop. The diagram below shows the `CatalogSource` flow (dedicated catalog pod running `opm serve`). With `ClusterCatalog`, the catalogd controller serves the same data without a per-catalog pod (see Section 1.1.6).
 
 ```mermaid
 flowchart TB
   subgraph cluster["Cluster API and controllers"]
-    A["User creates Subscription<br/>via oc or OperatorHub"]
-    B["API server / etcd stores:<br/>Subscription + installed CSV state"]
+    A["User creates or updates Subscription"]
+    B["API server stores Subscription<br/>+ currently installed CSV state"]
     C["Catalog Operator watches Subscription"]
     D["Catalog Operator reads<br/>spec.source / sourceNamespace"]
-    F["Catalog Operator resolves next hop<br/>using installed CSV + channel graph"]
+    F["Catalog Operator resolves next hop<br/>using installed CSV + channel upgrade graph"]
   end
 
-  subgraph catalog_source["Referenced catalog source"]
-    CS["CatalogSource / ClusterCatalog resource"]
-    subgraph catalog_pod["Catalog pod created from mirrored catalog image"]
-      IMG["Catalog image"]
-      subgraph fbc["FBC content inside the image"]
+  subgraph catalog_source["Referenced CatalogSource"]
+    CS["CatalogSource resource<br/>spec.image points to mirrored catalog"]
+    subgraph catalog_pod["Catalog pod"]
+      IMG["Pulls catalog image at startup"]
+      subgraph fbc["FBC content served from /configs/"]
         PKG["olm.package"]
-        CH["olm.channel entries"]
-        BND["olm.bundle metadata"]
+        CH["olm.channel entries + upgrade edges"]
+        BND["olm.bundle metadata + image refs"]
       end
-      GRPC["gRPC catalog service"]
+      GRPC["opm serve exposes gRPC API"]
     end
   end
 
@@ -340,9 +340,7 @@ oc-mirror is the supported Red Hat tool for copying OpenShift and operator conte
 
 ### 2.1 What oc-mirror does
 
-oc-mirror uses a single declarative **ImageSetConfiguration** file to decide what to copy. Internally, oc-mirror runs an **embedded container registry** on `localhost:55000` (configurable with `--port`) that acts as a local cache. During m2d, pulled images are stored in this cache before being archived. During d2m, the tarball is extracted into this cache, and images are pushed from it to the destination registry. This cache registry is transient — it runs only while oc-mirror is active and is not exposed outside the host.
-
-oc-mirror can mirror:
+oc-mirror uses a single declarative **ImageSetConfiguration** file to decide what to copy. It can mirror:
 
 - **Platform (OCP) release images and update graph** - For installing or upgrading the cluster itself in a disconnected way.
 - **Operator catalogs** - Catalog images (index images) and the bundle images they reference, so OLM on the disconnected cluster can install and upgrade operators.
@@ -365,6 +363,8 @@ Three workflows cover different connectivity patterns:
 For a full air-gap, you typically run **m2d** on a connected machine, transfer the tarballs, then run **d2m** on a host inside the secure network. If you have a bastion that can see both sides, **m2m** avoids the intermediate disk step.
 
 `m2m` is still mirror-to-mirror. In practice, it can be used for internal-to-internal promotion if the host can reach both source and destination registries and has valid credentials for both. The same reachability, auth, and policy checks still apply.
+
+**Internal cache registry:** Across all workflows, oc-mirror runs an **embedded container registry** on `localhost:55000` (configurable with `--port`) that acts as a local image cache. During m2d, pulled images are stored in this cache before being archived into tarballs. During d2m, the tarball is extracted into this cache, and images are pushed from it to the destination registry. This cache registry is transient — it runs only while oc-mirror is active and is not exposed outside the host. Understanding this is important for the d2m troubleshooting workaround in Section 2.14.
 
 ### 2.3 Set up oc-mirror
 
