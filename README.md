@@ -4,14 +4,14 @@
 
 This guide is for Red Hat consultants and customer platform teams who need to mirror and upgrade OLM-based operators in disconnected or air-gapped OpenShift environments.
 
-It focuses on the part that usually causes real project delays: **decision quality**. In air-gap programs, every mirror run has cost - time, bandwidth, media handling, security review, and change windows. The goal is not to mirror everything. The goal is to mirror exactly what your cluster needs, on a supported path, with predictable operational outcomes.
+Disconnected operator upgrades are harder than they should be. Every mirror run has real cost - time, bandwidth, media handling, security review, and change windows - and a failed or oversized run means repeating the entire transfer cycle. There is no room for trial and error.
 
-The official OpenShift and `oc-mirror` documentation already defines supported commands, schemas, and workflows. This guide is a companion to those references and focuses on practical execution choices:
+The official documentation covers supported commands and schemas, but leaves critical decisions to the reader: which bundles to actually mirror, how to compute the minimal upgrade path, and what to do when `oc-mirror` itself hits known issues like d2m catalog rebuild failures. This guide fills those gaps with practical techniques gathered from real disconnected deployments:
 
-- Choosing the exact supported target version from the support matrix
-- Selecting the right channel for that target and OCP version
-- Minimizing mirrored content by following real upgrade edges (`replaces` and `skipRange`)
-- Applying generated resources in the right order so the disconnected cluster behaves as expected
+- Computing the minimal supported upgrade path by inspecting raw catalog metadata (`replaces`, `skipRange`)
+- Building pruned catalog images for exact control over what OLM can see and install
+- Working around known d2m failures with `registries.conf` redirects
+- Applying generated resources in the tested order so the disconnected cluster behaves as expected
 
 After following this guide, you will be able to compute the minimal supported upgrade path for an operator, mirror only the required content, and apply it on a disconnected cluster with a predictable outcome.
 
@@ -84,7 +84,7 @@ In OpenShift, this metadata is stored in an OCI **catalog image** (also called *
 
 Some older releases and environments may also include **Red Hat Marketplace** (`redhat-marketplace`).
 
-Catalog images are versioned by OCP minor (for example `redhat-operator-index:v4.18`) and are not interchangeable across OCP minors. Modern index images carry **file-based catalog (FBC)** content. The FBC tooling is provided by **`opm`** (Operator Package Manager), which can render, validate, and serve catalog data. In this guide we primarily use `opm render` to dump catalog content to JSON for offline analysis.
+Catalog images are versioned by OCP minor (for example `redhat-operator-index:v4.18`) and are not interchangeable across OCP minors. Modern index images carry **file-based catalog (FBC)** content. The FBC tooling is provided by **`opm`**, described in detail below.
 
 **FBC data structure**
 
@@ -94,6 +94,27 @@ FBC data is a **stream of JSON objects** (one object per entity, concatenated or
 - `olm.channel` - channel definition with an `entries` array; each entry has a bundle name and upgrade edges (`replaces`, `skips`, `skipRange`)
 - `olm.bundle` - bundle metadata including the bundle `image` reference, `relatedImages` (operand container images), and `properties` (which include base64-encoded manifests as `olm.bundle.object`)
 - `olm.deprecations` - optional deprecation notices targeting specific packages, channels, or bundles
+
+**Example: how FBC objects relate** (from a real `redhat-operator-index:v4.16` render):
+
+```
+Package "advanced-cluster-management"
+├── defaultChannel: "release-2.14"
+├── Channel "release-2.11"
+│   ├── entry: "advanced-cluster-management.v2.11.3"
+│   │   ├── replaces: "advanced-cluster-management.v2.11.2"
+│   │   └── skipRange: ">=2.10.0 <2.11.3"
+│   └── entry: "advanced-cluster-management.v2.11.4"
+│       ├── replaces: "advanced-cluster-management.v2.11.3"
+│       └── skipRange: ">=2.10.0 <2.11.4"
+└── Bundle "advanced-cluster-management.v2.11.4"
+    ├── image: "registry.redhat.io/.../acm-operator-bundle@sha256:92e05b..."
+    └── relatedImages:
+        ├── "registry.redhat.io/.../ose-configmap-reloader-rhel9@sha256:5322ff..."
+        └── "registry.redhat.io/.../ose-oauth-proxy-rhel9@sha256:eab90e..."
+```
+
+The package owns channels, each channel has entries (bundle names + upgrade edges), and each bundle object holds the digest-pinned bundle image reference and the `relatedImages` list (operand images that the operator needs at runtime).
 
 **Catalog image on-disk layout:** Inside the catalog image, FBC data lives under `/configs/`. The primary file is `/configs/index.json` (or multiple files in that directory). When the catalog pod starts, `opm serve /configs` reads these files, optionally uses a prebuilt cache at `/tmp/cache/`, and exposes the content over a gRPC service that OLM queries. This on-disk layout is important to understand because it is the same structure you replicate when building a pruned catalog image manually (see Section 2.11).
 
@@ -107,6 +128,14 @@ FBC data is a **stream of JSON objects** (one object per entity, concatenated or
 ```
 
 Every `olm.package` must have a `defaultChannel` that points to a channel present in the catalog; otherwise `opm validate` fails and OLM cannot serve the catalog. This becomes important when building pruned catalogs (Section 2.11) or filtering with oc-mirror (Section 2.7).
+
+**`opm` (Operator Package Manager)** is a standalone CLI binary from the Operator Framework project. It is the tool used to build, validate, and serve FBC catalogs. Inside catalog images, the `opm` binary lives at `/bin/opm` and acts as the container entrypoint (running `opm serve` to expose catalog data over gRPC). On your workstation, you use it to inspect catalogs offline:
+
+- **`opm render <catalog-image>`** - pulls a catalog image and dumps its FBC content as a stream of JSON objects. This is how you extract the upgrade graph for offline analysis (see Section 3.1).
+- **`opm validate <dir>`** - validates FBC data in a directory against the schema. Used when building pruned catalogs (see Section 2.11).
+- **`opm serve <dir>`** - starts a gRPC server from FBC data. This is what runs inside catalog pods on the cluster.
+
+You can download `opm` from the [Red Hat Hybrid Cloud Console](https://console.redhat.com/openshift/downloads) (under **OpenShift disconnected installation tools**) or extract it from a catalog image at `/bin/opm`.
 
 Example of rendering and querying a catalog:
 
@@ -331,7 +360,8 @@ This page lists each operator's supported versions, the OCP versions they run on
 
 **Example:** If ACM 2.13 supports OCP 4.16-4.19 and ACM 2.15 supports OCP 4.18-4.21, then on OCP 4.18 you can upgrade ACM from 2.13 to 2.15, and then safely upgrade OCP to 4.20 while ACM 2.15 still supports it.
 
-**Version-paired operators:** Some operators are version-paired (e.g. ACM and MCE). The compatibility matrix shows each independently, but they must be upgraded together. Always cross-reference both operators when planning upgrades. The pairing is documented in the product release notes (for example ACM 2.13 pairs with MCE 2.8, ACM 2.15 pairs with MCE 2.10, ACM 2.17 pairs with MCE 2.17).
+**Version-paired operators:** Some operators are version-paired (e.g. ACM and MCE). The compatibility matrix shows each independently, but they must be upgraded together. Always cross-reference both operators when planning upgrades. The pairing is documented in the product release notes (for example ACM 2.13 pairs with MCE 2.8, ACM 2.15 pairs with MCE 2.10, ACM 2.17 pairs with MCE 2.17).[Fix - make this a warning as well?] [Fix - maybe add another warning that sometimes the default channel of a catalog does not correspond to the compatability matrix? e.g. catalog of 4.20 has the default channel - stable-3.x for operator foo but 4.20 is compatiable with stable-2.x...]
+
 
 ---
 
@@ -549,7 +579,7 @@ When in doubt, use `--dry-run` to validate your ImageSetConfiguration before com
 
 ### 2.8 Running m2d, d2m, and m2m
 
-**m2d (connected):** Destination is `file:///path/to/mirror-dir`. Output includes `mirror_seq1_000000.tar` (and more for large runs) plus `working-dir/` (metadata, sequence state, cluster-resources).
+**m2d (connected):** Destination is `file:///path/to/mirror-dir`. Output includes `mirror_seq1_000000.tar` (and more for large runs) plus `working-dir/` (metadata, sequence state, cluster-resources). [Fix - I am not sure that it is seq1_00000.tar.... double check]
 
 Transfer **only the tarballs**; leave `working-dir/` behind. It is regenerated when you run d2m.
 
@@ -585,7 +615,8 @@ The same applies to `mirror.platform`, `additionalImages`, and `helm` sections -
 > [!CAUTION]
 > Do not change the package/channel/version filters for an operator between m2d and d2m. d2m reuses pre-built catalog metadata from `working-dir/` by matching a hash of the operator's ISC entry. If the hash does not match (because you changed `minVersion`, added a channel, etc.), d2m attempts to re-filter the catalog, which can fail in a disconnected environment. The safe pattern is: start from the `isc_pinned_{timestamp}.yaml` that m2d generated (it is inside `working-dir/` after unarchive) and **remove** entries you do not need, rather than modifying filter parameters.
 
-**m2m (bastion):** Use `--workspace file:///path/to/workspace` and a `docker://` destination. No tarballs; content goes straight to the registry. The workspace holds only metadata.
+**m2m (bastion):** Use `--workspace file:///path/to/workspace` and a `docker://` destination. No tarballs; content goes straight to the registry. The workspace holds only metadata. [Fix - why is it here?]
+[Fix - I am pretty sure subset d2m will always fail with oc-mirror trying to go out to find the catalog but fail in disconnected. this will require the bastion ICSP shit...]
 
 **Incremental runs:** oc-mirror tracks state. Running m2d again with the same workspace mirrors only what changed. Use `--since YYYY-MM-DD` to restrict to content newer than a date. Delete the workspace only when you need a full reseed.
 
