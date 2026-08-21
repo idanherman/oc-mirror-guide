@@ -1,0 +1,14 @@
+# netobserv-operator: 1.7.0 -> 1.12.0 (stable channel head)
+# Path: 1.8.0 -> 1.8.1 -> 1.9.0 -> 1.9.1 -> 1.9.2 -> 1.9.3 -> 1.10.0 -> 1.10.1 -> 1.11.0 -> 1.11.1 -> 1.11.2 -> 1.12.0
+# Note: bundle names use "network-observability-operator" prefix (Red Hat naming mismatch)
+# Catalog rendered: 2026-06-30
+kind: ImageSetConfiguration
+apiVersion: mirror.openshift.io/v2alpha1
+mirror:
+  operators:
+    - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.16
+      packages:
+        - name: netobserv-operator
+          channels:
+            - name: stable
+              minVersion: 1.8.0

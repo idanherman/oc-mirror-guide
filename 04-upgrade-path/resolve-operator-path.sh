@@ -91,6 +91,9 @@ short_ver_from_bundle() {
   if [[ "$ver" == "$bundle_name" ]]; then
     ver="${bundle_name#"$OPERATOR".}"
   fi
+  if [[ "$ver" == "$bundle_name" ]]; then
+    ver="${bundle_name##*.v}"
+  fi
   printf '%s\n' "$ver"
 }
 

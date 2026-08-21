@@ -1,0 +1,13 @@
+# serverless-operator: 1.37.0 -> 1.37.1 (z-stream patch)
+# Path: 1.37.1 (stable) — direct hop via replaces
+# Catalog rendered: 2026-06-30
+kind: ImageSetConfiguration
+apiVersion: mirror.openshift.io/v2alpha1
+mirror:
+  operators:
+    - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.16
+      packages:
+        - name: serverless-operator
+          channels:
+            - name: stable
+              minVersion: 1.37.1
